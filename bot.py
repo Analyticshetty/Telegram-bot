@@ -5,8 +5,8 @@ import json
 import os
 import base64
 
-TELEGRAM_TOKEN = os.environ.get("8562937434:AAFom6wUE6WDdebR4_LGi8JREbT2Ndlihnc")
-GROQ_API_KEY = os.environ.get("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")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TEXT_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 DB_PATH = os.environ.get("DB_PATH", "bot_memory.db")
