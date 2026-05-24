@@ -4,6 +4,7 @@ import sqlite3
 import json
 import os
 import base64
+from rug_check import check_token, format_report, is_valid_solana_mint
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -47,6 +48,47 @@ def save_history(user_id, history):
     ''', (user_id, json.dumps(history)))
     conn.commit()
     conn.close()
+
+# ---------- RUG CHECK COMMAND ----------
+@bot.message_handler(commands=['check', 'rug'])
+def handle_check(message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "Usage: `/check <SOLANA_MINT_ADDRESS>`\n\nExample:\n`/check So11111111111111111111111111111111111111112`",
+            parse_mode="Markdown",
+        )
+        return
+    mint = parts[1].strip()
+    if not is_valid_solana_mint(mint):
+        bot.reply_to(message, "❌ That doesn't look like a Solana mint address (base58, 32–44 chars).")
+        return
+    bot.reply_to(message, f"🔍 Checking `{mint[:8]}...{mint[-6:]}`...", parse_mode="Markdown")
+    try:
+        result = check_token(mint)
+        bot.send_message(
+            message.chat.id,
+            format_report(result),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Check failed: {e.__class__.__name__}: {e}")
+
+
+@bot.message_handler(commands=['help', 'start'])
+def handle_help(message):
+    bot.reply_to(
+        message,
+        "*SSHETTY bot*\n\n"
+        "💬 Just message me — I'm a Groq-powered chat assistant.\n"
+        "📸 Send a photo — I'll describe it.\n"
+        "🛡 `/check <mint>` — Solana rug-check on a token address.\n\n"
+        "_Defensive checks only. Not financial advice._",
+        parse_mode="Markdown",
+    )
+
 
 # ---------- TEXT HANDLER ----------
 @bot.message_handler(func=lambda message: True)
