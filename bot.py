@@ -9,7 +9,8 @@ from tools import TOOLS_SCHEMA, execute_tool
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-TEXT_MODEL = "llama-3.3-70b-versatile"
+TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 DB_PATH = os.environ.get("DB_PATH", "bot_memory.db")
 MAX_HISTORY = 30  # cap to avoid runaway context
@@ -168,22 +169,36 @@ def handle_message(message):
 
     history = ensure_system_prompt(load_history(user_id))
     history.append({"role": "user", "content": user_text})
-    reply = chat_with_tools(history)
+    try:
+        reply = chat_with_tools(history)
+    except Exception as e:
+        reply = f"⚠️ Error: {e.__class__.__name__}: {str(e)[:300]}"
     history.append({"role": "assistant", "content": reply})
     save_history(user_id, history)
     bot.reply_to(message, reply)
 
 
+def _groq_call_with_tools(messages, model):
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=TOOLS_SCHEMA,
+        tool_choice="auto",
+        max_tokens=1024,
+    )
+
+
 def chat_with_tools(messages):
     """Groq chat loop with function-calling. Runs tools when Groq requests them."""
     for _ in range(MAX_TOOL_ITERATIONS):
-        response = client.chat.completions.create(
-            model=TEXT_MODEL,
-            messages=messages,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
-            max_tokens=1024,
-        )
+        try:
+            response = _groq_call_with_tools(messages, TEXT_MODEL)
+        except Exception as e:
+            # If primary model botches tool format, retry with fallback model
+            if "tool_use_failed" in str(e) or "Failed to call a function" in str(e):
+                response = _groq_call_with_tools(messages, TEXT_MODEL_FALLBACK)
+            else:
+                raise
         msg = response.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
