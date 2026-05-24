@@ -6,6 +6,7 @@ Free APIs used:
   - Rugcheck.xyz       (composite risk report)
   - DEXScreener        (liquidity / holders / age)
   - Solana mainnet RPC (mint & freeze authority — ground truth)
+  - GoPlus Security    (Bitget-equivalent risk engine — Solana endpoint)
 """
 
 import requests
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 RUGCHECK_URL    = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 SOLANA_RPC      = "https://api.mainnet-beta.solana.com"
+GOPLUS_URL      = "https://api.gopluslabs.io/api/v1/solana/token_security"
 TIMEOUT         = 8
 
 SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -48,6 +50,19 @@ def get_rugcheck(mint: str):
         r = requests.get(RUGCHECK_URL.format(mint=mint), timeout=TIMEOUT)
         if r.status_code == 200:
             return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def get_goplus(mint: str):
+    """GoPlus Solana token security — Bitget-equivalent risk engine."""
+    try:
+        r = requests.get(GOPLUS_URL, params={"contract_addresses": mint}, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            result = (data.get("result") or {}).get(mint) or (data.get("result") or {}).get(mint.lower())
+            return result
     except Exception:
         pass
     return None
@@ -141,7 +156,61 @@ def check_token(mint: str) -> dict:
     else:
         reasons_yellow.append("No DEXScreener pair found (may not be tradeable yet)")
 
-    # --- 3. Rugcheck.xyz composite ---
+    # --- 3. GoPlus Security (Bitget-equivalent risk engine) ---
+    gp = get_goplus(mint)
+    if gp:
+        details["goplus_trusted"] = gp.get("trusted_token")
+        # Mintable / freezable (cross-check with RPC)
+        mintable = (gp.get("mintable") or {})
+        if str(mintable.get("status")) == "1":
+            reasons_red.append("GoPlus: token is mintable")
+        closable = (gp.get("closable") or {})
+        if str(closable.get("status")) == "1":
+            reasons_red.append("GoPlus: account is closable (can be frozen)")
+        freezable = (gp.get("freezable") or {})
+        if str(freezable.get("status")) == "1":
+            reasons_red.append("GoPlus: token is freezable")
+        # Transfer fee — Bitget flags any non-zero
+        tf = (gp.get("transfer_fee") or {})
+        if tf:
+            fee_pct = tf.get("transfer_fee_percent") or tf.get("current_fee_rate")
+            if fee_pct and float(str(fee_pct).rstrip("%") or 0) > 0:
+                reasons_yellow.append(f"GoPlus: transfer fee {fee_pct}")
+        # Transfer hook (honeypot vector)
+        th = gp.get("transfer_hook") or {}
+        if th and th.get("status") == "1":
+            reasons_red.append("GoPlus: transfer hook present (honeypot risk)")
+        # Non-transferable
+        nt = (gp.get("non_transferable") or {})
+        if str(nt.get("status")) == "1":
+            reasons_red.append("GoPlus: non-transferable token")
+        # Default account state frozen
+        das = (gp.get("default_account_state") or {})
+        if das.get("default_account_state") == "frozen":
+            reasons_red.append("GoPlus: default account state is frozen")
+        # Top holders concentration (GoPlus returns 'holders')
+        holders = gp.get("holders") or []
+        if holders:
+            top10_pct = 0.0
+            for h in holders[:10]:
+                try:
+                    top10_pct += float(h.get("percent", 0)) * 100 if float(h.get("percent", 0)) < 1 else float(h.get("percent", 0))
+                except Exception:
+                    pass
+            details["top10_holders_pct"] = round(top10_pct, 1)
+            if top10_pct > 50:
+                reasons_red.append(f"Top 10 holders own {top10_pct:.0f}% — dump risk")
+            elif top10_pct > 30:
+                reasons_yellow.append(f"Top 10 holders own {top10_pct:.0f}% — concentrated")
+            else:
+                reasons_green.append(f"Top 10 holders {top10_pct:.0f}% — distributed")
+        # Trusted ecosystem token
+        if gp.get("trusted_token") == 1:
+            reasons_green.append("GoPlus: trusted Solana ecosystem token")
+    else:
+        reasons_yellow.append("GoPlus data unavailable")
+
+    # --- 4. Rugcheck.xyz composite ---
     rc = get_rugcheck(mint)
     if rc:
         score = rc.get("score") or rc.get("score_normalised")

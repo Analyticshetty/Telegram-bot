@@ -6,6 +6,7 @@ import os
 import base64
 from rug_check import check_token, format_report, is_valid_solana_mint
 from tools import TOOLS_SCHEMA, execute_tool
+from scanner import scan as run_scan, format_scan_results
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -144,10 +145,26 @@ def handle_help(message):
         "📸 Send a photo — I'll describe it.\n"
         "🛡 Paste any Solana CA — auto rug-check.\n"
         "🛡 `/check <mint>` — explicit form.\n"
+        "🔍 `/scan` — Bitget-Latest-equivalent token scanner.\n"
         "🧹 `/reset` — wipe conversation memory.\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
     )
+
+
+@bot.message_handler(commands=['scan'])
+def handle_scan(message):
+    bot.reply_to(message, "🔍 Scanning Solana new + trending pools… give me 15–30 seconds.")
+    try:
+        results = run_scan(limit_results=5)
+        bot.send_message(
+            message.chat.id,
+            format_scan_results(results),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Scan failed: {e.__class__.__name__}: {e}")
 
 
 @bot.message_handler(commands=['reset'])
