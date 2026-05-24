@@ -158,55 +158,74 @@ def check_token(mint: str) -> dict:
 
     # --- 3. GoPlus Security (Bitget-equivalent risk engine) ---
     gp = get_goplus(mint)
-    if gp:
+    if gp and isinstance(gp, dict):
         details["goplus_trusted"] = gp.get("trusted_token")
-        # Mintable / freezable (cross-check with RPC)
-        mintable = (gp.get("mintable") or {})
-        if str(mintable.get("status")) == "1":
-            reasons_red.append("GoPlus: token is mintable")
-        closable = (gp.get("closable") or {})
-        if str(closable.get("status")) == "1":
-            reasons_red.append("GoPlus: account is closable (can be frozen)")
-        freezable = (gp.get("freezable") or {})
-        if str(freezable.get("status")) == "1":
-            reasons_red.append("GoPlus: token is freezable")
-        # Transfer fee — Bitget flags any non-zero
-        tf = (gp.get("transfer_fee") or {})
-        if tf:
-            fee_pct = tf.get("transfer_fee_percent") or tf.get("current_fee_rate")
-            if fee_pct and float(str(fee_pct).rstrip("%") or 0) > 0:
-                reasons_yellow.append(f"GoPlus: transfer fee {fee_pct}")
-        # Transfer hook (honeypot vector)
-        th = gp.get("transfer_hook") or {}
-        if th and th.get("status") == "1":
-            reasons_red.append("GoPlus: transfer hook present (honeypot risk)")
-        # Non-transferable
-        nt = (gp.get("non_transferable") or {})
-        if str(nt.get("status")) == "1":
-            reasons_red.append("GoPlus: non-transferable token")
-        # Default account state frozen
-        das = (gp.get("default_account_state") or {})
-        if das.get("default_account_state") == "frozen":
-            reasons_red.append("GoPlus: default account state is frozen")
-        # Top holders concentration (GoPlus returns 'holders')
-        holders = gp.get("holders") or []
-        if holders:
-            top10_pct = 0.0
-            for h in holders[:10]:
-                try:
-                    top10_pct += float(h.get("percent", 0)) * 100 if float(h.get("percent", 0)) < 1 else float(h.get("percent", 0))
-                except Exception:
-                    pass
-            details["top10_holders_pct"] = round(top10_pct, 1)
-            if top10_pct > 50:
-                reasons_red.append(f"Top 10 holders own {top10_pct:.0f}% — dump risk")
-            elif top10_pct > 30:
-                reasons_yellow.append(f"Top 10 holders own {top10_pct:.0f}% — concentrated")
-            else:
-                reasons_green.append(f"Top 10 holders {top10_pct:.0f}% — distributed")
-        # Trusted ecosystem token
-        if gp.get("trusted_token") == 1:
-            reasons_green.append("GoPlus: trusted Solana ecosystem token")
+
+        def _status_is_1(field_name):
+            """Safely extract status from a GoPlus field that may be dict/str/None."""
+            v = gp.get(field_name)
+            if isinstance(v, dict):
+                return str(v.get("status")) == "1"
+            if isinstance(v, str):
+                return v == "1"
+            return False
+
+        try:
+            if _status_is_1("mintable"):
+                reasons_red.append("GoPlus: token is mintable")
+            if _status_is_1("closable"):
+                reasons_red.append("GoPlus: account is closable (can be frozen)")
+            if _status_is_1("freezable"):
+                reasons_red.append("GoPlus: token is freezable")
+            if _status_is_1("non_transferable"):
+                reasons_red.append("GoPlus: non-transferable token")
+            if _status_is_1("transfer_hook"):
+                reasons_red.append("GoPlus: transfer hook present (honeypot risk)")
+
+            # Transfer fee
+            tf = gp.get("transfer_fee")
+            if isinstance(tf, dict):
+                fee_pct = tf.get("transfer_fee_percent") or tf.get("current_fee_rate")
+                if fee_pct:
+                    try:
+                        if float(str(fee_pct).rstrip("%")) > 0:
+                            reasons_yellow.append(f"GoPlus: transfer fee {fee_pct}")
+                    except Exception:
+                        pass
+
+            # Default account state frozen
+            das = gp.get("default_account_state")
+            if isinstance(das, dict) and das.get("default_account_state") == "frozen":
+                reasons_red.append("GoPlus: default account state is frozen")
+            elif isinstance(das, str) and das == "frozen":
+                reasons_red.append("GoPlus: default account state is frozen")
+
+            # Top holders concentration
+            holders = gp.get("holders") or []
+            if isinstance(holders, list) and holders:
+                top10_pct = 0.0
+                for h in holders[:10]:
+                    if not isinstance(h, dict):
+                        continue
+                    try:
+                        pct = float(h.get("percent", 0) or 0)
+                        # GoPlus returns either 0-1 fractions or 0-100; normalise
+                        top10_pct += pct * 100 if pct < 1 else pct
+                    except Exception:
+                        pass
+                details["top10_holders_pct"] = round(top10_pct, 1)
+                if top10_pct > 50:
+                    reasons_red.append(f"Top 10 holders own {top10_pct:.0f}% — dump risk")
+                elif top10_pct > 30:
+                    reasons_yellow.append(f"Top 10 holders own {top10_pct:.0f}% — concentrated")
+                else:
+                    reasons_green.append(f"Top 10 holders {top10_pct:.0f}% — distributed")
+
+            # Trusted ecosystem token
+            if gp.get("trusted_token") == 1 or gp.get("trusted_token") == "1":
+                reasons_green.append("GoPlus: trusted Solana ecosystem token")
+        except Exception as e:
+            reasons_yellow.append(f"GoPlus parse warning: {e.__class__.__name__}")
     else:
         reasons_yellow.append("GoPlus data unavailable")
 
