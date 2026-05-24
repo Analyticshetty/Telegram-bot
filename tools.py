@@ -6,9 +6,10 @@ import os
 import json
 import requests
 
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-TAVILY_URL     = "https://api.tavily.com/search"
-TIMEOUT        = 12
+TAVILY_API_KEY  = os.environ.get("TAVILY_API_KEY")
+TAVILY_URL      = "https://api.tavily.com/search"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+TIMEOUT         = 12
 
 
 # ---------- Tool implementations ----------
@@ -67,6 +68,41 @@ def fetch_url(url: str) -> str:
         return f"Fetch error: {e.__class__.__name__}: {e}"
 
 
+def get_token_data(mint: str) -> str:
+    """Live DEXScreener data for a Solana token: price, MC, FDV, liquidity, volume."""
+    try:
+        r = requests.get(DEXSCREENER_URL.format(mint=mint), timeout=TIMEOUT)
+        if r.status_code != 200:
+            return f"DEXScreener returned HTTP {r.status_code}"
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return f"No DEXScreener pair found for {mint}. Token may be too new or untracked."
+        # Use pair with highest liquidity
+        pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+        p = pairs[0]
+        base = p.get("baseToken") or {}
+        out = {
+            "symbol":       base.get("symbol"),
+            "name":         base.get("name"),
+            "price_usd":    p.get("priceUsd"),
+            "market_cap":   p.get("marketCap"),
+            "fdv":          p.get("fdv"),  # Bitget usually displays FDV as MC
+            "liquidity_usd": (p.get("liquidity") or {}).get("usd"),
+            "volume_1h":    (p.get("volume") or {}).get("h1"),
+            "volume_24h":   (p.get("volume") or {}).get("h24"),
+            "price_change_1h":  (p.get("priceChange") or {}).get("h1"),
+            "price_change_24h": (p.get("priceChange") or {}).get("h24"),
+            "txns_1h":      (p.get("txns") or {}).get("h1"),
+            "dex":          p.get("dexId"),
+            "pair_url":     p.get("url"),
+            "pair_created_at": p.get("pairCreatedAt"),
+        }
+        return json.dumps(out, indent=2)
+    except Exception as e:
+        return f"get_token_data error: {e.__class__.__name__}: {e}"
+
+
 # ---------- Tool schema for Groq function calling ----------
 
 TOOLS_SCHEMA = [
@@ -89,6 +125,29 @@ TOOLS_SCHEMA = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_token_data",
+            "description": (
+                "Get LIVE on-chain data for a specific Solana token: current price, "
+                "market cap, FDV, liquidity, 1h/24h volume, price change. ALWAYS use "
+                "this (NOT web_search) when the user asks about a specific token's "
+                "price, MC, FDV, volume, or liquidity. Note: Bitget app usually "
+                "displays FDV labeled as 'MC' — show both to the user when relevant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mint": {
+                        "type": "string",
+                        "description": "Solana mint address (base58, 32-44 chars).",
+                    },
+                },
+                "required": ["mint"],
             },
         },
     },
@@ -118,6 +177,8 @@ TOOLS_SCHEMA = [
 def execute_tool(name: str, args: dict) -> str:
     if name == "web_search":
         return web_search(args.get("query", ""))
+    if name == "get_token_data":
+        return get_token_data(args.get("mint", ""))
     if name == "fetch_url":
         return fetch_url(args.get("url", ""))
     return f"Unknown tool: {name}"

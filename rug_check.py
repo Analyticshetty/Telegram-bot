@@ -119,9 +119,16 @@ def check_token(mint: str) -> dict:
         liq_usd = (pair.get("liquidity") or {}).get("usd") or 0
         details["liquidity_usd"] = liq_usd
         details["price_usd"]     = pair.get("priceUsd")
+        details["market_cap"]    = pair.get("marketCap")
+        details["fdv"]           = pair.get("fdv")
+        details["volume_24h"]    = (pair.get("volume") or {}).get("h24")
+        details["volume_1h"]     = (pair.get("volume") or {}).get("h1")
+        details["price_change_1h"]  = (pair.get("priceChange") or {}).get("h1")
+        details["price_change_24h"] = (pair.get("priceChange") or {}).get("h24")
         details["pair_url"]      = pair.get("url")
         details["dex"]           = pair.get("dexId")
         details["pair_address"]  = pair.get("pairAddress")
+        details["symbol"]        = (pair.get("baseToken") or {}).get("symbol")
 
         if liq_usd < 1000:
             reasons_red.append(f"Liquidity only ${liq_usd:,.0f} — exit will be impossible")
