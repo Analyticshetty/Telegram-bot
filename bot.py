@@ -94,7 +94,23 @@ def handle_help(message):
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = message.chat.id
-    user_text = message.text
+    user_text = (message.text or "").strip()
+
+    # Auto-route: if message is a bare Solana mint address, run rug check
+    if is_valid_solana_mint(user_text):
+        bot.reply_to(message, f"🔍 Detected Solana CA — checking `{user_text[:8]}...{user_text[-6:]}`...", parse_mode="Markdown")
+        try:
+            result = check_token(user_text)
+            bot.send_message(
+                message.chat.id,
+                format_report(result),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            bot.reply_to(message, f"⚠️ Check failed: {e.__class__.__name__}: {e}")
+        return
+
     history = load_history(user_id)
     history.append({"role": "user", "content": user_text})
     response = client.chat.completions.create(
