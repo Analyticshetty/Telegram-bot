@@ -11,6 +11,22 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TEXT_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 DB_PATH = os.environ.get("DB_PATH", "bot_memory.db")
+MAX_HISTORY = 30  # cap to avoid runaway context
+
+SYSTEM_PROMPT = (
+    "You are SSHETTY bot — a brutally honest Solana memecoin and crypto trading "
+    "assistant for Shashi. You help with rug detection, on-chain analysis, trade "
+    "discipline, and meme coin strategy. You have a built-in /check command that "
+    "runs mechanical on-chain rug checks (mint authority, freeze authority, "
+    "liquidity, age, Rugcheck composite). When the user pastes a Solana CA, that "
+    "check auto-runs and the result is in this conversation. Use it as context.\n\n"
+    "Rules you enforce:\n"
+    "- Never recommend buying a token marked RED.\n"
+    "- For YELLOW, only allow buys with strict $5 position + 2x take-profit + 50% cost-basis-out plan.\n"
+    "- For GREEN, remind user that mechanical pass != price will pump. Most clean tokens still die quietly.\n"
+    "- Always remind: post-grad survivor zone is MC $80K–$250K, age 1h–12h.\n"
+    "- Brutal honesty. No sugarcoating. Short answers preferred."
+)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
@@ -39,6 +55,10 @@ def load_history(user_id):
     return []
 
 def save_history(user_id, history):
+    # Trim non-system messages to last MAX_HISTORY
+    sys_msgs = [m for m in history if m["role"] == "system"]
+    other    = [m for m in history if m["role"] != "system"][-MAX_HISTORY:]
+    history  = sys_msgs + other
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -48,6 +68,45 @@ def save_history(user_id, history):
     ''', (user_id, json.dumps(history)))
     conn.commit()
     conn.close()
+
+def ensure_system_prompt(history):
+    if not history or history[0].get("role") != "system":
+        history = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    else:
+        # Refresh in case prompt evolved
+        history[0] = {"role": "system", "content": SYSTEM_PROMPT}
+    return history
+
+
+def run_rug_check_and_remember(message, mint: str):
+    """Run rug check, send report to user, and write everything into chat history
+    so follow-up questions like 'is it safe to buy?' have full context."""
+    user_id = message.chat.id
+    bot.reply_to(message, f"🔍 Checking `{mint[:8]}...{mint[-6:]}`...", parse_mode="Markdown")
+    try:
+        result = check_token(mint)
+        report = format_report(result)
+        bot.send_message(
+            user_id,
+            report,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        # Inject into history so Groq remembers it
+        history = ensure_system_prompt(load_history(user_id))
+        history.append({"role": "user", "content": f"[Pasted Solana CA] {mint}"})
+        compact = (
+            f"Rug-check result for {mint}:\n"
+            f"VERDICT: {result['verdict']}\n"
+            f"Red flags: {result.get('reasons_red') or 'none'}\n"
+            f"Warnings: {result.get('reasons_yellow') or 'none'}\n"
+            f"Passed: {result.get('reasons_green') or 'none'}\n"
+            f"Details: {result.get('details')}"
+        )
+        history.append({"role": "assistant", "content": compact})
+        save_history(user_id, history)
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Check failed: {e.__class__.__name__}: {e}")
 
 # ---------- RUG CHECK COMMAND ----------
 @bot.message_handler(commands=['check', 'rug'])
@@ -64,17 +123,7 @@ def handle_check(message):
     if not is_valid_solana_mint(mint):
         bot.reply_to(message, "❌ That doesn't look like a Solana mint address (base58, 32–44 chars).")
         return
-    bot.reply_to(message, f"🔍 Checking `{mint[:8]}...{mint[-6:]}`...", parse_mode="Markdown")
-    try:
-        result = check_token(mint)
-        bot.send_message(
-            message.chat.id,
-            format_report(result),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Check failed: {e.__class__.__name__}: {e}")
+    run_rug_check_and_remember(message, mint)
 
 
 @bot.message_handler(commands=['help', 'start'])
@@ -82,12 +131,20 @@ def handle_help(message):
     bot.reply_to(
         message,
         "*SSHETTY bot*\n\n"
-        "💬 Just message me — I'm a Groq-powered chat assistant.\n"
+        "💬 Just message me — Groq-powered crypto assistant with memory.\n"
         "📸 Send a photo — I'll describe it.\n"
-        "🛡 `/check <mint>` — Solana rug-check on a token address.\n\n"
+        "🛡 Paste any Solana CA — auto rug-check.\n"
+        "🛡 `/check <mint>` — explicit form.\n"
+        "🧹 `/reset` — wipe conversation memory.\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
     )
+
+
+@bot.message_handler(commands=['reset'])
+def handle_reset(message):
+    save_history(message.chat.id, [{"role": "system", "content": SYSTEM_PROMPT}])
+    bot.reply_to(message, "🧹 Memory wiped. Fresh start.")
 
 
 # ---------- TEXT HANDLER ----------
@@ -98,20 +155,10 @@ def handle_message(message):
 
     # Auto-route: if message is a bare Solana mint address, run rug check
     if is_valid_solana_mint(user_text):
-        bot.reply_to(message, f"🔍 Detected Solana CA — checking `{user_text[:8]}...{user_text[-6:]}`...", parse_mode="Markdown")
-        try:
-            result = check_token(user_text)
-            bot.send_message(
-                message.chat.id,
-                format_report(result),
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            bot.reply_to(message, f"⚠️ Check failed: {e.__class__.__name__}: {e}")
+        run_rug_check_and_remember(message, user_text)
         return
 
-    history = load_history(user_id)
+    history = ensure_system_prompt(load_history(user_id))
     history.append({"role": "user", "content": user_text})
     response = client.chat.completions.create(
         model=TEXT_MODEL,
