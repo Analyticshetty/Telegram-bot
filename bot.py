@@ -5,6 +5,7 @@ import json
 import os
 import base64
 from rug_check import check_token, format_report, is_valid_solana_mint
+from tools import TOOLS_SCHEMA, execute_tool
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -20,6 +21,11 @@ SYSTEM_PROMPT = (
     "runs mechanical on-chain rug checks (mint authority, freeze authority, "
     "liquidity, age, Rugcheck composite). When the user pastes a Solana CA, that "
     "check auto-runs and the result is in this conversation. Use it as context.\n\n"
+    "You have two web tools available via function calling:\n"
+    "  - web_search(query): live web search for current info, prices, news, social mentions.\n"
+    "  - fetch_url(url): read the full content of a specific URL.\n"
+    "Use them whenever the user asks about anything time-sensitive or current. Do not "
+    "guess at prices, news, or current events — search first.\n\n"
     "Rules you enforce:\n"
     "- Never recommend buying a token marked RED.\n"
     "- For YELLOW, only allow buys with strict $5 position + 2x take-profit + 50% cost-basis-out plan.\n"
@@ -27,6 +33,8 @@ SYSTEM_PROMPT = (
     "- Always remind: post-grad survivor zone is MC $80K–$250K, age 1h–12h.\n"
     "- Brutal honesty. No sugarcoating. Short answers preferred."
 )
+
+MAX_TOOL_ITERATIONS = 4
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
@@ -160,15 +168,52 @@ def handle_message(message):
 
     history = ensure_system_prompt(load_history(user_id))
     history.append({"role": "user", "content": user_text})
-    response = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=history,
-        max_tokens=1024
-    )
-    reply = response.choices[0].message.content
+    reply = chat_with_tools(history)
     history.append({"role": "assistant", "content": reply})
     save_history(user_id, history)
     bot.reply_to(message, reply)
+
+
+def chat_with_tools(messages):
+    """Groq chat loop with function-calling. Runs tools when Groq requests them."""
+    for _ in range(MAX_TOOL_ITERATIONS):
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=messages,
+            tools=TOOLS_SCHEMA,
+            tool_choice="auto",
+            max_tokens=1024,
+        )
+        msg = response.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            return msg.content or "(empty response)"
+        # Record the assistant's tool-call turn
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in tool_calls
+            ],
+        })
+        # Execute each tool call and append result
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            result = execute_tool(tc.function.name, args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result[:6000],
+            })
+    return "I tried searching but ran out of steps. Try rephrasing the question."
 
 # ---------- IMAGE HANDLER ----------
 @bot.message_handler(content_types=['photo'])
