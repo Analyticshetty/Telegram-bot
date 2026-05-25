@@ -166,11 +166,12 @@ def check_wallets_hold_token(mint: str) -> list:
 
 # ---------- FORMATTER ----------
 
-def format_smart_wallet_section(mint: str) -> str:
+def format_smart_wallet_section(mint: str, symbol: str = None) -> str:
     """
     Returns Telegram-formatted smart wallet block to append to rug-check report.
-    Called from rug_check.format_report() — mint is in result["details"]["mint"].
+    Called from rug_check.format_report() — mint + symbol come from result["details"].
     """
+    token_label = f"${symbol}" if symbol else "this token"
     active_wallets = load_wallets()
     total = len(active_wallets)
 
@@ -184,7 +185,7 @@ def format_smart_wallet_section(mint: str) -> str:
     count   = len(holders)
 
     if count == 0:
-        return f"\n🐋 *Smart wallets:* ⚪ 0 of {total} tracked hold this"
+        return f"\n🐋 *Smart wallets:* ⚪ 0 of {total} tracked hold {token_label}"
 
     labels = [h["label"] for h in holders[:3]]
     label_str = ", ".join(labels)
@@ -193,6 +194,6 @@ def format_smart_wallet_section(mint: str) -> str:
 
     signal = "🔥" if count >= 3 else "👀"
     return (
-        f"\n🐋 *Smart wallets:* {signal} *{count} of {total}* tracked hold this\n"
+        f"\n🐋 *Smart wallets:* {signal} *{count} of {total}* tracked hold {token_label}\n"
         f"   ({label_str})"
     )

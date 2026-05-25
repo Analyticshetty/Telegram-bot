@@ -574,7 +574,7 @@ def format_report(result: dict) -> str:
     # Smart wallet section — network call, cached 5 min
     mint = d.get("mint")
     if mint:
-        lines.append(format_smart_wallet_section(mint))
+        lines.append(format_smart_wallet_section(mint, symbol=d.get("symbol")))
 
     lines.append("\n_Mechanical on-chain checks only. Does not predict price, dead launches, slow rugs, or your discipline._")
     return "\n".join(lines)
