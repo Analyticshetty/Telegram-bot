@@ -233,6 +233,10 @@ def check_token(mint: str) -> dict:
     reasons_green  = []
     details = {"mint": mint}
 
+    # Pre-fetch GoPlus once so we know trusted status before clone detection
+    gp_data = get_goplus(mint)
+    is_trusted_ecosystem = bool(gp_data and isinstance(gp_data, dict) and gp_data.get("trusted_token") in (1, "1"))
+
     # --- 1. Solana RPC: mint + freeze authority (ground truth) ---
     try:
         mint_auth, freeze_auth = get_mint_authorities(mint)
@@ -302,29 +306,33 @@ def check_token(mint: str) -> dict:
                 reasons_yellow.append(f"Sell-side {sell_pct:.0f}% — bearish flow")
 
         # --- 2a. CLONE DETECTION ---
-        try:
-            clone = detect_clone(mint, details.get("symbol"), pair)
-            details["clone_check"] = clone
-            if clone["is_original"] is False:
-                # Severity: how much bigger is the "real" one?
-                real_liq = clone.get("real_liq", 0)
-                this_liq = details.get("liquidity_usd") or 1
-                gap = real_liq / this_liq if this_liq > 0 else 1
-                sym = details.get("symbol")
-                if gap >= 10:
-                    reasons_red.append(
-                        f"CLONE: another '{sym}' has {gap:.0f}x more liquidity (${real_liq:,.0f}). "
-                        f"Real CA: {clone['real_ca']}"
-                    )
-                else:
-                    reasons_yellow.append(
-                        f"AMBIGUITY: another '{sym}' has more liq (${real_liq:,.0f}). "
-                        f"Verify which you want. Other CA: {clone['real_ca']}"
-                    )
-            elif clone["is_original"] is True and clone.get("peer_count"):
-                reasons_green.append(f"Original — #1 of {clone['peer_count']} '{details.get('symbol')}' tokens")
-        except Exception as e:
-            reasons_yellow.append(f"Clone check failed: {e.__class__.__name__}")
+        # Skip clone check entirely for ecosystem-trusted tokens (SOL, USDC, etc.)
+        if is_trusted_ecosystem:
+            reasons_green.append("Verified ecosystem token — clone check skipped")
+            details["clone_check"] = {"is_original": True, "reason": "GoPlus trusted_token"}
+        else:
+            try:
+                clone = detect_clone(mint, details.get("symbol"), pair)
+                details["clone_check"] = clone
+                if clone["is_original"] is False:
+                    real_liq = clone.get("real_liq", 0)
+                    this_liq = details.get("liquidity_usd") or 1
+                    gap = real_liq / this_liq if this_liq > 0 else 1
+                    sym = details.get("symbol")
+                    if gap >= 10:
+                        reasons_red.append(
+                            f"CLONE: another '{sym}' has {gap:.0f}x more liquidity (${real_liq:,.0f}). "
+                            f"Real CA: {clone['real_ca']}"
+                        )
+                    else:
+                        reasons_yellow.append(
+                            f"AMBIGUITY: another '{sym}' has more liq (${real_liq:,.0f}). "
+                            f"Verify which you want. Other CA: {clone['real_ca']}"
+                        )
+                elif clone["is_original"] is True and clone.get("peer_count"):
+                    reasons_green.append(f"Original — #1 of {clone['peer_count']} '{details.get('symbol')}' tokens")
+            except Exception as e:
+                reasons_yellow.append(f"Clone check failed: {e.__class__.__name__}")
 
         # --- 2b. LIFECYCLE STAGE ---
         stage, stage_desc = detect_lifecycle_stage(pair.get("dexId"), details.get("age_minutes"))
@@ -355,8 +363,8 @@ def check_token(mint: str) -> dict:
     else:
         reasons_yellow.append("No DEXScreener pair found (may not be tradeable yet)")
 
-    # --- 3. GoPlus Security (Bitget-equivalent risk engine) ---
-    gp = get_goplus(mint)
+    # --- 3. GoPlus Security (Bitget-equivalent risk engine) — already pre-fetched ---
+    gp = gp_data
     if gp and isinstance(gp, dict):
         details["goplus_trusted"] = gp.get("trusted_token")
 
