@@ -7,9 +7,11 @@ import base64
 from rug_check import check_token, format_report, is_valid_solana_mint
 from tools import TOOLS_SCHEMA, execute_tool
 from scanner import scan as run_scan, format_scan_results
+from smart_wallets import add_wallet, remove_wallet, load_wallets, _all_wallets
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
+OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
 TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -53,6 +55,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS conversations (
             user_id INTEGER PRIMARY KEY,
             history TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
         )
     ''')
     conn.commit()
@@ -148,12 +156,118 @@ def handle_help(message):
         "💬 Just message me — Groq-powered crypto assistant with memory.\n"
         "📸 Send a photo — I'll describe it.\n"
         "🛡 Paste any Solana CA — auto rug-check.\n"
-        "🛡 `/check <mint>` — explicit form.\n"
+        "🛡 `/check <mint>` — explicit rug-check.\n"
         "🔍 `/scan` — Bitget-Latest-equivalent token scanner.\n"
         "🧹 `/reset` — wipe conversation memory.\n\n"
+        "*Smart Wallet Tracker (owner only):*\n"
+        "🐋 `/addwallet <addr> <label>` — track a wallet.\n"
+        "📋 `/listwallets` — show all tracked wallets.\n"
+        "❌ `/removewallet <addr>` — stop tracking a wallet.\n"
+        "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
     )
+
+
+# ---------- OWNER GUARD ----------
+def is_owner(message) -> bool:
+    """Returns True only if sender is the bot owner (OWNER_TELEGRAM_ID env var)."""
+    if not OWNER_TELEGRAM_ID:
+        return False
+    return str(message.chat.id) == str(OWNER_TELEGRAM_ID)
+
+def owner_only(message) -> bool:
+    """Sends rejection and returns False if not owner."""
+    if is_owner(message):
+        return True
+    bot.reply_to(message, "⛔ Owner-only command.")
+    return False
+
+
+# ---------- SMART WALLET COMMANDS ----------
+@bot.message_handler(commands=['addwallet'])
+def handle_addwallet(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Usage: `/addwallet <solana_address> <label>`\nExample: `/addwallet AbC...xyz ansem`", parse_mode="Markdown")
+        return
+    addr, label = parts[1].strip(), parts[2].strip()
+    if not is_valid_solana_mint(addr):
+        bot.reply_to(message, "❌ That doesn't look like a valid Solana address.")
+        return
+    if add_wallet(addr, label):
+        active = load_wallets()
+        bot.reply_to(message, f"✅ Added `{label}` (`{addr[:8]}...`). Total tracked: {len(active)}", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, f"⚠️ Address already tracked.")
+
+
+@bot.message_handler(commands=['removewallet'])
+def handle_removewallet(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/removewallet <solana_address>`", parse_mode="Markdown")
+        return
+    addr = parts[1].strip()
+    if remove_wallet(addr):
+        bot.reply_to(message, f"✅ Removed `{addr[:8]}...`", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, f"⚠️ Address not found in tracked list.")
+
+
+@bot.message_handler(commands=['listwallets'])
+def handle_listwallets(message):
+    if not owner_only(message):
+        return
+    all_w = _all_wallets()
+    active = [w for w in all_w if not str(w.get("address", "")).startswith("TODO")]
+    todo   = [w for w in all_w if str(w.get("address", "")).startswith("TODO")]
+
+    lines = [f"*Smart Wallet List* ({len(active)} active, {len(todo)} pending)\n"]
+    if active:
+        for w in active:
+            addr = w.get("address", "")
+            lines.append(f"• `{addr[:8]}...{addr[-4:]}` — {w.get('label','?')} _(src: {w.get('source','?')})_")
+    else:
+        lines.append("_(No active wallets yet — add via /addwallet)_")
+
+    if todo:
+        lines.append(f"\n_{len(todo)} TODO placeholder(s) — replace in smart\\_wallets.json_")
+
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- CAPITAL COMMAND ----------
+@bot.message_handler(commands=['capital'])
+def handle_capital(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        # Show current
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT value FROM bot_state WHERE key='capital_usd'").fetchone()
+        conn.close()
+        cap = row[0] if row else "25"
+        bot.reply_to(message, f"💰 Current capital: *${cap}*\nTo update: `/capital 50`", parse_mode="Markdown")
+        return
+    try:
+        amount = float(parts[1].strip().replace("$", ""))
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO bot_state(key,value) VALUES('capital_usd',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(amount),)
+        )
+        conn.commit()
+        conn.close()
+        entry = round(amount * 0.15, 2)
+        bot.reply_to(message, f"✅ Capital updated to *${amount:.2f}*\n15% entry size = *${entry:.2f}*", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid amount. Example: `/capital 50`", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=['scan'])

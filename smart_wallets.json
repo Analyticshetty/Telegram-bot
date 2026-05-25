@@ -1,0 +1,51 @@
+{
+  "version": "2026-05-25",
+  "notes": "VERIFY each wallet on gmgn.ai or kolscan.io before relying on it. Add your own via /addwallet. Sources listed per entry.",
+  "wallets": [
+    {
+      "address": "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm",
+      "label": "ansem",
+      "source": "public-kol",
+      "confidence": "HIGH — widely reported across Datawallet, KOLSCAN, multiple crypto outlets",
+      "added": "2026-05-25",
+      "win_count": null,
+      "verify_url": "https://gmgn.ai/sol/address/AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm"
+    },
+    {
+      "address": "9HCTuTPEiQvkUtLmTZvK6uch4E3pDynwJTbNw6jLhp9z",
+      "label": "trump-flipper",
+      "source": "web-research",
+      "confidence": "MEDIUM — from Bitget News / ChainCatcher 1000-wallet analysis. Turned $511K into $4.8M on TRUMP, 49% win rate. Verify before trusting.",
+      "added": "2026-05-25",
+      "win_count": null,
+      "verify_url": "https://gmgn.ai/sol/address/9HCTuTPEiQvkUtLmTZvK6uch4E3pDynwJTbNw6jLhp9z"
+    },
+    {
+      "address": "5fWkLJfoDsRAaXhPJcJY19qNtDDQ5h6q1SPzsAPRrUNG",
+      "label": "meme-specialist-58pct",
+      "source": "web-research",
+      "confidence": "MEDIUM — same 1000-wallet analysis. 58% win rate, $1.4M realized profit, 205 tokens traded in 90 days. Verify before trusting.",
+      "added": "2026-05-25",
+      "win_count": null,
+      "verify_url": "https://gmgn.ai/sol/address/5fWkLJfoDsRAaXhPJcJY19qNtDDQ5h6q1SPzsAPRrUNG"
+    },
+    {
+      "address": "6kbwsSY4hL6WVadLRLnWV2irkMN2AvFZVAS8McKJmAtJ",
+      "label": "jellyjelly-griffain-trader",
+      "source": "web-research",
+      "confidence": "MEDIUM — same 1000-wallet analysis. $1.3M profit, 52% win rate, profited on JELLYJELLY + GRIFFAIN. Verify before trusting.",
+      "added": "2026-05-25",
+      "win_count": null,
+      "verify_url": "https://gmgn.ai/sol/address/6kbwsSY4hL6WVadLRLnWV2irkMN2AvFZVAS8McKJmAtJ"
+    },
+    {
+      "address": "H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM",
+      "label": "gmgn-early-entry",
+      "source": "web-research",
+      "confidence": "MEDIUM — cited in multiple GMGN summaries as early-entry specialist on explosive memecoins. Verify before trusting.",
+      "added": "2026-05-25",
+      "win_count": null,
+      "verify_url": "https://gmgn.ai/sol/address/H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM"
+    }
+  ]
+}

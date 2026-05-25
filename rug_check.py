@@ -12,6 +12,7 @@ Free APIs used:
 import requests
 import re
 from datetime import datetime, timezone
+from smart_wallets import format_smart_wallet_section
 
 RUGCHECK_URL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 DEXSCREENER_URL    = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -569,6 +570,11 @@ def format_report(result: dict) -> str:
         lines.append("\n*✅ Passed:*")
         for r in result["reasons_green"]:
             lines.append(f"• {r}")
+
+    # Smart wallet section — network call, cached 5 min
+    mint = d.get("mint")
+    if mint:
+        lines.append(format_smart_wallet_section(mint))
 
     lines.append("\n_Mechanical on-chain checks only. Does not predict price, dead launches, slow rugs, or your discipline._")
     return "\n".join(lines)
