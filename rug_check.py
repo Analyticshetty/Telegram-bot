@@ -13,11 +13,12 @@ import requests
 import re
 from datetime import datetime, timezone
 
-RUGCHECK_URL    = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
-DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
-SOLANA_RPC      = "https://api.mainnet-beta.solana.com"
-GOPLUS_URL      = "https://api.gopluslabs.io/api/v1/solana/token_security"
-TIMEOUT         = 8
+RUGCHECK_URL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+DEXSCREENER_URL    = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/"
+SOLANA_RPC         = "https://api.mainnet-beta.solana.com"
+GOPLUS_URL         = "https://api.gopluslabs.io/api/v1/solana/token_security"
+TIMEOUT            = 8
 
 SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -66,6 +67,145 @@ def get_goplus(mint: str):
     except Exception:
         pass
     return None
+
+
+def search_by_symbol(symbol: str):
+    """Search DEXScreener for all Solana pairs matching this symbol. Returns list."""
+    if not symbol or len(symbol) < 2:
+        return []
+    try:
+        r = requests.get(DEXSCREENER_SEARCH, params={"q": symbol}, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return []
+        pairs = (r.json() or {}).get("pairs") or []
+        # Solana only, exact symbol match (case-insensitive)
+        sym_l = symbol.lower()
+        out = []
+        for p in pairs:
+            if p.get("chainId") != "solana":
+                continue
+            base = p.get("baseToken") or {}
+            if (base.get("symbol") or "").lower() == sym_l:
+                out.append(p)
+        return out
+    except Exception:
+        return []
+
+
+def detect_clone(current_mint: str, current_symbol: str, current_pair: dict):
+    """Check if current token is the original or a clone.
+    Returns dict with: is_original (bool), real_ca (str or None), reason, peers (list)."""
+    if not current_symbol:
+        return {"is_original": None, "real_ca": None, "reason": "no symbol", "peers": []}
+    peers = search_by_symbol(current_symbol)
+    # Group by mint (DEXScreener may return multiple pairs per token)
+    by_mint = {}
+    for p in peers:
+        base = p.get("baseToken") or {}
+        m = base.get("address")
+        if not m:
+            continue
+        liq = (p.get("liquidity") or {}).get("usd") or 0
+        if m not in by_mint or liq > by_mint[m]["liquidity"]:
+            by_mint[m] = {
+                "mint":       m,
+                "liquidity":  liq,
+                "created_at": p.get("pairCreatedAt") or 0,
+                "volume_24h": (p.get("volume") or {}).get("h24") or 0,
+                "fdv":        p.get("fdv") or 0,
+                "pair_url":   p.get("url"),
+            }
+    candidates = list(by_mint.values())
+    if len(candidates) <= 1:
+        return {"is_original": True, "real_ca": current_mint, "reason": "only token with this symbol", "peers": []}
+    # Score each: higher liq + older = more likely real
+    def score(c):
+        return (c["liquidity"] or 0) + (c["volume_24h"] or 0) * 0.1 + (1e15 - (c["created_at"] or 1e15)) * 1e-9
+    candidates.sort(key=score, reverse=True)
+    top = candidates[0]
+    is_original = (top["mint"].lower() == current_mint.lower())
+    return {
+        "is_original": is_original,
+        "real_ca":     top["mint"],
+        "real_liq":    top["liquidity"],
+        "real_url":    top["pair_url"],
+        "peer_count":  len(candidates),
+        "reason":      (
+            f"this CA ranks #1 of {len(candidates)} '{current_symbol}' tokens"
+            if is_original
+            else f"another '{current_symbol}' token has higher liquidity (${top['liquidity']:,.0f} vs current)"
+        ),
+        "peers":       candidates[:5],
+    }
+
+
+def detect_lifecycle_stage(dex: str, age_minutes):
+    """Returns ('stage', 'description')."""
+    if age_minutes is None:
+        return ("unknown", "age unknown")
+    dex_l = (dex or "").lower()
+    if dex_l in ("pumpfun", "pump-fun", "pump"):
+        return ("pre_grad", "Pre-graduation (still on pump.fun bonding curve)")
+    if age_minutes < 60:
+        return ("just_grad", f"Just-graduated ({age_minutes:.0f}min ago — most volatile)")
+    if age_minutes < 720:
+        return ("post_grad", f"Post-grad survivor ({age_minutes/60:.1f}h — the sweet spot)")
+    if age_minutes < 1440:
+        return ("maturing", f"Maturing ({age_minutes/60:.1f}h — past initial pump)")
+    return ("established", f"Established ({age_minutes/1440:.1f}d old)")
+
+
+def detect_wash_trading(pair: dict):
+    """Heuristic wash-trading detection. Returns (is_wash, reason or None)."""
+    if not pair:
+        return (False, None)
+    liq = (pair.get("liquidity") or {}).get("usd") or 0
+    vol_24h = (pair.get("volume") or {}).get("h24") or 0
+    pc_24h = (pair.get("priceChange") or {}).get("h24") or 0
+    txns_24h = (pair.get("txns") or {}).get("h24") or {}
+    buys, sells = txns_24h.get("buys") or 0, txns_24h.get("sells") or 0
+    if liq < 1000:
+        return (False, None)
+    vl_ratio = vol_24h / liq
+    # Suspicious if huge volume but barely any price movement
+    if vl_ratio > 20 and abs(pc_24h) < 15:
+        return (True, f"vol/liq ratio {vl_ratio:.1f}x with only {pc_24h:+.1f}% price move — looks washed")
+    # Suspicious if exact 50/50 buys/sells (bot pattern) at high volume
+    if buys + sells > 200 and abs(buys - sells) / (buys + sells) < 0.02:
+        return (True, f"buys/sells exactly balanced ({buys}/{sells}) — bot pattern")
+    return (False, None)
+
+
+def multi_window_flow(pair: dict):
+    """Returns flow direction per window. Each entry: ('5m', buys, sells, ratio_pct, icon)."""
+    if not pair:
+        return []
+    txns = pair.get("txns") or {}
+    out = []
+    for win in ("m5", "h1", "h6", "h24"):
+        t = txns.get(win) or {}
+        b, s = t.get("buys") or 0, t.get("sells") or 0
+        total = b + s
+        if total == 0:
+            out.append((win, 0, 0, None, "—"))
+            continue
+        ratio = b / total * 100
+        icon = "🟢" if ratio >= 55 else "🟡" if ratio >= 45 else "🔴"
+        out.append((win, b, s, ratio, icon))
+    return out
+
+
+def detect_sniper_concentration(top_pct, age_minutes):
+    """Heuristic: high top-holder % on a young token = snipers loaded up."""
+    if top_pct is None or age_minutes is None:
+        return (None, None)
+    if age_minutes < 120 and top_pct > 35:
+        return ("HIGH", f"Top holders own {top_pct:.0f}% on a {age_minutes:.0f}min-old token — sniper bags loaded")
+    if age_minutes < 360 and top_pct > 50:
+        return ("HIGH", f"Top holders own {top_pct:.0f}% on a {age_minutes/60:.1f}h-old token — heavy sniper concentration")
+    if age_minutes < 720 and top_pct > 40:
+        return ("MEDIUM", f"Top holders own {top_pct:.0f}% in post-grad window — watch for dumps")
+    return ("LOW", None)
 
 
 def get_dexscreener(mint: str):
@@ -160,6 +300,58 @@ def check_token(mint: str) -> dict:
                 reasons_red.append(f"Sell pressure {sell_pct:.0f}% in 24h — heavy dumping")
             elif sell_pct > 55:
                 reasons_yellow.append(f"Sell-side {sell_pct:.0f}% — bearish flow")
+
+        # --- 2a. CLONE DETECTION ---
+        try:
+            clone = detect_clone(mint, details.get("symbol"), pair)
+            details["clone_check"] = clone
+            if clone["is_original"] is False:
+                # Severity: how much bigger is the "real" one?
+                real_liq = clone.get("real_liq", 0)
+                this_liq = details.get("liquidity_usd") or 1
+                gap = real_liq / this_liq if this_liq > 0 else 1
+                sym = details.get("symbol")
+                if gap >= 10:
+                    reasons_red.append(
+                        f"CLONE: another '{sym}' has {gap:.0f}x more liquidity (${real_liq:,.0f}). "
+                        f"Real CA: {clone['real_ca']}"
+                    )
+                else:
+                    reasons_yellow.append(
+                        f"AMBIGUITY: another '{sym}' has more liq (${real_liq:,.0f}). "
+                        f"Verify which you want. Other CA: {clone['real_ca']}"
+                    )
+            elif clone["is_original"] is True and clone.get("peer_count"):
+                reasons_green.append(f"Original — #1 of {clone['peer_count']} '{details.get('symbol')}' tokens")
+        except Exception as e:
+            reasons_yellow.append(f"Clone check failed: {e.__class__.__name__}")
+
+        # --- 2b. LIFECYCLE STAGE ---
+        stage, stage_desc = detect_lifecycle_stage(pair.get("dexId"), details.get("age_minutes"))
+        details["lifecycle_stage"] = stage
+        details["lifecycle_desc"]  = stage_desc
+        if stage == "pre_grad":
+            reasons_yellow.append("Pre-graduation pump.fun token — extreme volatility expected")
+        elif stage == "just_grad":
+            reasons_yellow.append("Just-graduated — most volatile window, snipers active")
+
+        # --- 2c. MULTI-WINDOW FLOW ---
+        flow = multi_window_flow(pair)
+        details["flow_windows"] = flow
+        # Score flow agreement
+        ratios = [r[3] for r in flow if r[3] is not None]
+        if ratios:
+            avg_ratio = sum(ratios) / len(ratios)
+            if avg_ratio >= 55 and all(r >= 50 for r in ratios):
+                reasons_green.append(f"Strong buy flow across all windows (avg {avg_ratio:.0f}%)")
+            elif avg_ratio < 45:
+                reasons_red.append(f"Sell-dominant flow (avg {avg_ratio:.0f}% buys)")
+
+        # --- 2d. WASH-TRADING DETECTION ---
+        is_wash, wash_reason = detect_wash_trading(pair)
+        if is_wash:
+            reasons_red.append(f"Wash-trading suspected: {wash_reason}")
+            details["wash_flag"] = wash_reason
     else:
         reasons_yellow.append("No DEXScreener pair found (may not be tradeable yet)")
 
@@ -228,6 +420,24 @@ def check_token(mint: str) -> dict:
                 else:
                     reasons_green.append(f"Top 10 holders {top10_pct:.0f}% — distributed")
 
+                # --- 3a. SNIPER CONCENTRATION HEURISTIC ---
+                top5_pct = 0.0
+                for h in holders[:5]:
+                    if not isinstance(h, dict):
+                        continue
+                    try:
+                        pct = float(h.get("percent", 0) or 0)
+                        top5_pct += pct * 100 if pct < 1 else pct
+                    except Exception:
+                        pass
+                details["top5_holders_pct"] = round(top5_pct, 1)
+                sniper_level, sniper_reason = detect_sniper_concentration(top5_pct, details.get("age_minutes"))
+                details["sniper_level"] = sniper_level
+                if sniper_level == "HIGH":
+                    reasons_red.append(f"Sniper risk HIGH: {sniper_reason}")
+                elif sniper_level == "MEDIUM":
+                    reasons_yellow.append(f"Sniper risk: {sniper_reason}")
+
             # Trusted ecosystem token
             if gp.get("trusted_token") == 1 or gp.get("trusted_token") == "1":
                 reasons_green.append("GoPlus: trusted Solana ecosystem token")
@@ -290,14 +500,52 @@ def format_report(result: dict) -> str:
     lines = [f"{icon} *{label}*", ""]
 
     d = result["details"]
+
+    # Token header
+    if d.get("symbol"):
+        lines.append(f"*{d['symbol']}*")
+    if d.get("market_cap") or d.get("fdv"):
+        mc = d.get("market_cap") or 0
+        fdv = d.get("fdv") or 0
+        if mc and fdv and abs(mc - fdv) > mc * 0.1:
+            lines.append(f"📈 MC ${mc:,.0f}  |  FDV ${fdv:,.0f} *(Bitget shows FDV)*")
+        elif fdv:
+            lines.append(f"📈 MC ${fdv:,.0f}")
     if d.get("liquidity_usd") is not None:
         lines.append(f"💧 Liquidity: ${d['liquidity_usd']:,.0f}")
     if d.get("age_minutes") is not None:
         age = d["age_minutes"]
         age_str = f"{age:.0f} min" if age < 60 else f"{age/60:.1f} h" if age < 1440 else f"{age/1440:.1f} d"
         lines.append(f"⏱ Age: {age_str}")
+    if d.get("volume_24h") is not None:
+        lines.append(f"📊 24h vol: ${d['volume_24h']:,.0f}")
+
+    # Identity / clone check
+    clone = d.get("clone_check") or {}
+    if clone.get("is_original") is True and clone.get("peer_count"):
+        lines.append(f"\n🆔 *Identity:* ✅ Original — #1 of {clone['peer_count']} same-symbol tokens")
+    elif clone.get("is_original") is False:
+        lines.append(f"\n🆔 *Identity:* ⚠️ *CLONE RISK*")
+        lines.append(f"   Real CA: `{clone.get('real_ca')}`")
+        lines.append(f"   Real liq: ${clone.get('real_liq', 0):,.0f}")
+
+    # Lifecycle
+    if d.get("lifecycle_desc"):
+        lines.append(f"\n🔄 *Lifecycle:* {d['lifecycle_desc']}")
+
+    # Flow direction
+    flow = d.get("flow_windows") or []
+    if flow:
+        lines.append("\n🌊 *Flow direction:*")
+        for win, b, s, ratio, icon_ in flow:
+            win_lbl = {"m5": "5m", "h1": "1h", "h6": "6h", "h24": "24h"}.get(win, win)
+            if ratio is None:
+                lines.append(f"   {win_lbl}: {icon_} no trades")
+            else:
+                lines.append(f"   {win_lbl}: {icon_} {ratio:.0f}% buys ({b}/{b+s})")
+
     if d.get("rugcheck_score") is not None:
-        lines.append(f"📊 Rugcheck score: {d['rugcheck_score']}")
+        lines.append(f"\n📊 Rugcheck score: {d['rugcheck_score']}")
     if d.get("pair_url"):
         lines.append(f"🔗 [DEXScreener]({d['pair_url']})")
 
