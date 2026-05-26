@@ -1,15 +1,15 @@
 """
-Wallet Discovery — finds active profitable wallets using Solscan + GeckoTerminal.
+Wallet Discovery — finds active profitable wallets using Helius + GeckoTerminal.
 
 Strategy:
   1. Pull Solana tokens from GeckoTerminal (trending + new)
-  2. For each token, get top holders via Solscan free API
-     Solscan returns OWNER wallets directly — no ATA resolution, no Solana RPC
+  2. For each token, call Helius getTokenAccounts — returns owner wallets directly
   3. Wallets appearing as top holder in 2+ tokens = smart money candidate
-  4. Verify activity via Solana RPC getSignaturesForAddress (1 call per candidate)
+  4. Verify activity via Helius getSignaturesForAddress
   5. Add to smart_wallets.json
 """
 
+import os
 import requests
 import time
 import re
@@ -19,16 +19,15 @@ from smart_wallets import add_wallet, load_wallets
 
 log = logging.getLogger(__name__)
 
-SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
-GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
-GECKO_NEW      = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-SOLSCAN_HOLDERS = "https://public-api.solscan.io/token/holders"
-TIMEOUT        = 10
-GECKO_TIMEOUT  = 6
-ACTIVITY_DAYS  = 7
-MIN_TOKEN_HITS = 2
-MAX_WORKERS    = 5
-SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+HELIUS_API_KEY  = os.environ.get("HELIUS_API_KEY", "")
+GECKO_TRENDING  = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
+GECKO_NEW       = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+TIMEOUT         = 12
+GECKO_TIMEOUT   = 6
+ACTIVITY_DAYS   = 7
+MIN_TOKEN_HITS  = 2
+MAX_WORKERS     = 5
+SOLANA_MINT_RE  = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 SKIP_ADDRESSES = {
     "11111111111111111111111111111111",
@@ -44,21 +43,8 @@ SKIP_ADDRESSES = {
 }
 
 
-# ---------- Solana RPC (only used for activity check) ----------
-
-def _rpc(method: str, params: list):
-    try:
-        r = requests.post(
-            SOLANA_RPC,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=TIMEOUT,
-        )
-        body = r.json()
-        if "error" in body:
-            return None
-        return body.get("result")
-    except Exception:
-        return None
+def _helius_url():
+    return f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 
 # ---------- TOKEN DISCOVERY ----------
@@ -122,43 +108,55 @@ def _get_tokens(limit: int = 60) -> list:
     return tokens[:limit]
 
 
-# ---------- HOLDER LOOKUP via Solscan ----------
+# ---------- HOLDER LOOKUP via Helius ----------
 
 def _get_holder_wallets(mint: str, debug_callback=None) -> list:
     """
-    Returns up to 10 owner wallet addresses using Solscan free holder API.
-    Solscan returns actual wallet owners — no ATA resolution, no Solana RPC calls.
+    Returns up to 10 owner wallet addresses using Helius getTokenAccounts.
+    Returns 'owner' directly — no ATA resolution needed.
     """
     try:
-        r = requests.get(
-            SOLSCAN_HOLDERS,
-            params={"tokenAddress": mint, "limit": 10, "offset": 0},
-            headers={"accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        r = requests.post(
+            _helius_url(),
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccounts",
+                "params": {
+                    "mint": mint,
+                    "limit": 10,
+                    "page": 1,
+                },
+            },
             timeout=TIMEOUT,
         )
         if r.status_code != 200:
             if debug_callback:
-                debug_callback(f"🔬 {mint[:8]}: Solscan HTTP {r.status_code}")
+                debug_callback(f"🔬 {mint[:8]}: Helius HTTP {r.status_code} — {r.text[:100]}")
             return []
 
-        data = r.json().get("data") or []
+        body = r.json()
+        if "error" in body:
+            if debug_callback:
+                debug_callback(f"🔬 {mint[:8]}: Helius error: {body['error']}")
+            return []
+
+        accounts = (body.get("result") or {}).get("token_accounts") or []
         owners = []
-        for item in data:
-            # Solscan returns 'owner' = actual wallet, 'address' = token account (ATA)
-            addr = item.get("owner") or ""
-            if not addr:
-                addr = item.get("address") or ""
-            if addr and SOLANA_MINT_RE.match(addr) and addr not in SKIP_ADDRESSES:
-                owners.append(addr)
+        for acct in accounts:
+            owner = acct.get("owner") or ""
+            amount = acct.get("amount") or 0
+            if owner and int(amount) > 0 and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
+                owners.append(owner)
 
         if debug_callback:
-            debug_callback(f"🔬 {mint[:8]}: Solscan → {len(owners)} holders")
+            debug_callback(f"🔬 {mint[:8]}: Helius → {len(owners)} holders from {len(accounts)} accounts")
 
         return owners
 
     except Exception as e:
         if debug_callback:
-            debug_callback(f"🔬 {mint[:8]}: Solscan error: {e}")
+            debug_callback(f"🔬 {mint[:8]}: Helius exception: {e}")
         return []
 
 
@@ -166,10 +164,22 @@ def _get_holder_wallets(mint: str, debug_callback=None) -> list:
 
 def _is_active(address: str) -> bool:
     cutoff = int(time.time()) - (ACTIVITY_DAYS * 86400)
-    result = _rpc("getSignaturesForAddress", [address, {"limit": 1, "commitment": "confirmed"}])
-    if not isinstance(result, list) or not result:
+    try:
+        r = requests.post(
+            _helius_url(),
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [address, {"limit": 1, "commitment": "confirmed"}],
+            },
+            timeout=TIMEOUT,
+        )
+        result = r.json().get("result")
+        if not isinstance(result, list) or not result:
+            return False
+        return (result[0].get("blockTime") or 0) >= cutoff
+    except Exception:
         return False
-    return (result[0].get("blockTime") or 0) >= cutoff
 
 
 # ---------- MAIN ----------
@@ -179,30 +189,29 @@ def discover_wallets(progress_callback=None) -> dict:
         if progress_callback:
             progress_callback(msg)
 
+    if not HELIUS_API_KEY:
+        _p("❌ HELIUS_API_KEY not set in Railway env vars. Add it and redeploy.")
+        return {"added": 0, "skipped_quality": 0, "skipped_inactive": 0,
+                "skipped_duplicate": 0, "total_checked": 0, "sources": {}}
+
     already = {w["address"].lower() for w in load_wallets()}
 
-    # Step 1: get tokens
     _p("🔍 Fetching tokens from GeckoTerminal (trending + new pools)...")
     tokens = _get_tokens(limit=60)
 
     if not tokens:
-        _p("⚠️ No tokens returned by GeckoTerminal. Check Railway internet connectivity.")
+        _p("⚠️ GeckoTerminal returned 0 tokens. Check Railway connectivity.")
         return {"added": 0, "skipped_quality": 0, "skipped_inactive": 0,
                 "skipped_duplicate": len(already), "total_checked": 0, "sources": {}}
 
-    _p(f"📋 {len(tokens)} tokens found. Fetching top holders via Solscan...")
+    _p(f"📋 {len(tokens)} tokens found. Fetching holders via Helius...")
 
-    # Step 2: for each token, collect top holder wallets
     wallet_hits: dict = {}
-    solscan_errors = 0
 
     for i, tok in enumerate(tokens):
         dbg = _p if i < 5 else None
         owners = _get_holder_wallets(tok["mint"], debug_callback=dbg)
         sym    = tok.get("symbol") or tok["mint"][:6]
-
-        if not owners and i < 5:
-            solscan_errors += 1
 
         for addr in owners:
             if addr.lower() in already:
@@ -215,23 +224,19 @@ def discover_wallets(progress_callback=None) -> dict:
         if (i + 1) % 10 == 0:
             _p(f"⏳ {i+1}/{len(tokens)} tokens done — {len(wallet_hits)} unique wallets so far")
 
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     total_unique = len(wallet_hits)
 
     if total_unique == 0:
-        if solscan_errors >= 3:
-            _p("❌ Solscan API blocked or down. Try: /addwallet <addr> <label> manually.")
-        else:
-            _p(f"⚠️ {len(tokens)} tokens checked, 0 new unique wallets found (all may be already tracked or filtered).")
+        _p(f"⚠️ 0 new wallets found across {len(tokens)} tokens. All may already be tracked.")
         return {
             "added": 0, "skipped_quality": 0, "skipped_inactive": 0,
-            "skipped_duplicate": len(already), "total_checked": 0, "sources": {"solscan": 0},
+            "skipped_duplicate": len(already), "total_checked": 0, "sources": {"helius": 0},
         }
 
-    _p(f"👥 {total_unique} unique wallets across all tokens.")
+    _p(f"👥 {total_unique} unique wallets found.")
 
-    # Step 3: keep wallets appearing in 2+ tokens
     candidates = sorted(
         [(a, info) for a, info in wallet_hits.items() if info["count"] >= MIN_TOKEN_HITS],
         key=lambda x: x[1]["count"],
@@ -240,13 +245,12 @@ def discover_wallets(progress_callback=None) -> dict:
     skipped_quality = total_unique - len(candidates)
 
     if not candidates:
-        _p(f"⚠️ {total_unique} wallets found but none in 2+ tokens — lowering to 1 for this run...")
+        _p(f"⚠️ None appeared in 2+ tokens — using all {total_unique} for this run...")
         candidates = list(wallet_hits.items())[:30]
         skipped_quality = 0
 
-    _p(f"⭐ {len(candidates)} candidates. Checking on-chain activity (last 7 days)...")
+    _p(f"⭐ {len(candidates)} candidates. Checking activity (last 7 days)...")
 
-    # Step 4: activity check
     added            = 0
     skipped_inactive = 0
 
@@ -271,5 +275,5 @@ def discover_wallets(progress_callback=None) -> dict:
         "skipped_inactive":  skipped_inactive,
         "skipped_duplicate": len(already),
         "total_checked":     len(candidates),
-        "sources":           {"solscan": added},
+        "sources":           {"helius": added},
     }
