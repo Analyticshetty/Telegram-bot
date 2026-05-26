@@ -8,6 +8,7 @@ from rug_check import check_token, format_report, is_valid_solana_mint
 from tools import TOOLS_SCHEMA, execute_tool
 from scanner import scan as run_scan, format_scan_results
 from smart_wallets import add_wallet, remove_wallet, load_wallets, _all_wallets
+from wallet_discovery import discover_wallets
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
@@ -163,6 +164,7 @@ def handle_help(message):
         "🐋 `/addwallet <addr> <label>` — track a wallet.\n"
         "📋 `/listwallets` — show all tracked wallets.\n"
         "❌ `/removewallet <addr>` — stop tracking a wallet.\n"
+        "🔍 `/discoverwallet` — auto-find & add active profitable wallets from GMGN.\n"
         "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
@@ -239,6 +241,64 @@ def handle_listwallets(message):
         lines.append(f"\n_{len(todo)} TODO placeholder(s) — replace in smart\\_wallets.json_")
 
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- WALLET DISCOVERY ----------
+@bot.message_handler(commands=['discoverwallet', 'discoverwallets'])
+def handle_discover(message):
+    if not owner_only(message):
+        return
+    bot.reply_to(
+        message,
+        "🔍 Starting wallet discovery...\n"
+        "Fetching from GMGN + verifying each wallet is active on-chain.\n"
+        "This takes 2–4 minutes. I'll update you as I go.",
+        parse_mode="Markdown",
+    )
+
+    chat_id = message.chat.id
+
+    def progress(msg):
+        try:
+            bot.send_message(chat_id, msg)
+        except Exception:
+            pass
+
+    try:
+        result = discover_wallets(progress_callback=progress)
+
+        added    = result["added"]
+        total    = len(load_wallets())
+        sources  = result["sources"]
+        src_str  = ", ".join(f"{k}: {v}" for k, v in sources.items()) if sources else "none"
+
+        summary = (
+            f"✅ *Discovery complete!*\n\n"
+            f"🐋 *{added} new wallets added* (total: {total})\n"
+            f"❌ {result['skipped_quality']} failed quality filter (win rate / PNL / trades)\n"
+            f"😴 {result['skipped_inactive']} inactive (no tx in 7 days)\n"
+            f"♻️ {result['skipped_duplicate']} already in your list\n\n"
+            f"Sources: {src_str}\n\n"
+            f"Run `/listwallets` to see the full list.\n"
+            f"Run `/discoverwallet` again anytime to refresh."
+        )
+
+        if added == 0:
+            summary += (
+                "\n\n⚠️ *0 added — GMGN may have blocked the request.*\n"
+                "This happens if their API changes or rate-limits kick in.\n"
+                "Try again in 10 minutes or add wallets manually via `/addwallet`."
+            )
+
+        bot.send_message(chat_id, summary, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.send_message(
+            chat_id,
+            f"⚠️ Discovery failed: `{e.__class__.__name__}: {str(e)[:200]}`\n"
+            "GMGN may have blocked the request. Try again later or use `/addwallet` manually.",
+            parse_mode="Markdown",
+        )
 
 
 # ---------- CAPITAL COMMAND ----------
