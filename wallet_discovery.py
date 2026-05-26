@@ -1,236 +1,256 @@
 """
-Wallet Discovery — auto-populates smart_wallets.json with real active traders.
+Wallet Discovery — finds active profitable wallets without any paid APIs or Cloudflare.
 
-Sources (all free, no auth):
-  1. GMGN frontend API — top Solana smart money by 30D PNL
-  2. GMGN smart degen tag — active memecoin specialists
-  3. Rugcheck leaderboard — wallets that trade safe tokens
+Strategy (same logic as Dragon, using only APIs already in the bot):
+  1. Pull 30 recently successful Solana tokens from GeckoTerminal
+     (age 1-48h, high volume, positive price, liquidity $10K-$2M)
+  2. For each token, fetch top 10 holders via GoPlus
+  3. Wallets appearing as top holder in 2+ DIFFERENT winning tokens = smart money
+  4. Filter out known program/pool addresses
+  5. Verify each candidate has on-chain activity in last 7 days (Solana RPC)
+  6. Add qualifying wallets to smart_wallets.json
 
-Activity filter: every wallet must have a Solana transaction in the last 7 days.
-Quality filter: win_rate >= 0.50, pnl_30d > 0, at least 20 trades in 30d.
-
-Usage: /discoverwallet in Telegram (owner-only).
+No auth. No Cloudflare. All free. Self-improving — runs anytime with /discoverwallet.
 """
 
 import requests
 import time
+import re
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from smart_wallets import add_wallet, load_wallets
 
 log = logging.getLogger(__name__)
 
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-TIMEOUT    = 10
-HEADERS    = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer":    "https://gmgn.ai/",
-    "Accept":     "application/json",
+SOLANA_RPC      = "https://api.mainnet-beta.solana.com"
+GOPLUS_URL      = "https://api.gopluslabs.io/api/v1/solana/token_security"
+GECKO_TRENDING  = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
+GECKO_NEW       = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+TIMEOUT         = 10
+ACTIVITY_DAYS   = 7
+MIN_TOKEN_HITS  = 2      # wallet must appear in top-holders of this many winning tokens
+MAX_WORKERS     = 8
+SOLANA_MINT_RE  = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+# Known non-human addresses to skip
+SKIP_ADDRESSES = {
+    "11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bNX",
+    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
 }
 
-# GMGN frontend endpoints (what their website hits — no auth needed)
-GMGN_RANK_URL   = "https://gmgn.ai/defi/quotation/v1/rank/sol/wallets/7d"
-GMGN_SMART_URL  = "https://gmgn.ai/defi/quotation/v1/smartmoney/sol/wallets"
 
-# Quality thresholds
-MIN_WIN_RATE   = 0.50   # 50% win rate minimum
-MIN_TRADES_30D = 10     # must have traded at least 10 tokens in 30 days
-MIN_PNL_30D    = 0      # must be profitable (any positive PNL)
-MAX_WALLETS    = 100    # cap to avoid spamming RPC
-ACTIVITY_DAYS  = 7      # wallet must have tx in last N days
+# ---------- TOKEN DISCOVERY ----------
 
+def _get_successful_tokens(limit: int = 30) -> list:
+    """Returns list of winning Solana tokens from GeckoTerminal trending + new pools."""
+    tokens = []
+    seen   = set()
 
-# ---------- GMGN FETCHERS ----------
-
-def _fetch_gmgn_rank(limit: int = 50) -> list:
-    """Fetch top Solana traders by 7D PNL from GMGN rank page."""
-    wallets = []
-    try:
-        params = {
-            "orderby":    "pnl",
-            "direction":  "desc",
-            "limit":      limit,
-            "filters[]":  "smart_degen",
-        }
-        r = requests.get(GMGN_RANK_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            items = (data.get("data") or {}).get("rank") or data.get("data") or []
-            for item in items:
-                addr = item.get("wallet_address") or item.get("address")
-                if addr and len(addr) > 30:
-                    wallets.append({
-                        "address":   addr,
-                        "win_rate":  float(item.get("winrate") or item.get("win_rate") or 0),
-                        "pnl_30d":   float(item.get("pnl_30d") or item.get("realized_profit_30d") or 0),
-                        "trades_30d": int(item.get("buy_30d") or item.get("txs_30d") or 0),
-                        "source":    "gmgn-rank",
-                    })
-    except Exception as e:
-        log.warning(f"GMGN rank fetch failed: {e}")
-    return wallets
-
-
-def _fetch_gmgn_smart(limit: int = 50) -> list:
-    """Fetch smart money / KOL wallets from GMGN smart money endpoint."""
-    wallets = []
-    for tag in ("smart_degen", "kol", "sniper"):
+    for url in (GECKO_TRENDING, GECKO_NEW):
         try:
-            params = {
-                "tag":       tag,
-                "orderby":   "pnl_30d",
-                "direction": "desc",
-                "limit":     limit,
-            }
-            r = requests.get(GMGN_SMART_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code == 200:
-                data = r.json()
-                items = (data.get("data") or {}).get("wallets") or data.get("data") or []
-                for item in items:
-                    addr = item.get("wallet_address") or item.get("address")
-                    if addr and len(addr) > 30:
-                        wallets.append({
-                            "address":    addr,
-                            "win_rate":   float(item.get("winrate") or item.get("win_rate") or 0),
-                            "pnl_30d":    float(item.get("pnl_30d") or item.get("realized_profit") or 0),
-                            "trades_30d": int(item.get("buy_30d") or item.get("txs_30d") or 0),
-                            "source":     f"gmgn-{tag}",
-                        })
+            r = requests.get(
+                url,
+                params={"page": 1},
+                headers={"Accept": "application/json"},
+                timeout=TIMEOUT,
+            )
+            if r.status_code != 200:
+                continue
+            pools = r.json().get("data") or []
+            for pool in pools:
+                attr = pool.get("attributes") or {}
+                rel  = pool.get("relationships") or {}
+
+                # Extract mint from relationships
+                bt_id = ((rel.get("base_token") or {}).get("data") or {}).get("id") or ""
+                mint  = bt_id.replace("solana_", "")
+
+                if not mint or not SOLANA_MINT_RE.match(mint) or mint in seen:
+                    continue
+                seen.add(mint)
+
+                liq = float(attr.get("reserve_in_usd") or 0)
+                vol = float((attr.get("volume_usd") or {}).get("h24") or 0)
+                pc  = float((attr.get("price_change_percentage") or {}).get("h24") or 0)
+
+                # Parse age
+                age_minutes = None
+                created_at  = attr.get("pool_created_at") or ""
+                if created_at:
+                    try:
+                        from datetime import datetime, timezone
+                        created     = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60
+                    except Exception:
+                        pass
+
+                # Quality filter
+                if liq < 10_000 or liq > 2_000_000:
+                    continue
+                if vol < 5_000:
+                    continue
+                if pc < 5:
+                    continue
+                if age_minutes and (age_minutes < 60 or age_minutes > 2880):
+                    continue
+
+                tokens.append({
+                    "mint":    mint,
+                    "symbol":  attr.get("name") or mint[:6],
+                    "liq":     liq,
+                    "vol":     vol,
+                    "pc":      pc,
+                })
+
+                if len(tokens) >= limit:
+                    break
         except Exception as e:
-            log.warning(f"GMGN smart/{tag} fetch failed: {e}")
-    return wallets
+            log.warning(f"GeckoTerminal fetch failed: {e}")
+
+        if len(tokens) >= limit:
+            break
+
+    return tokens[:limit]
+
+
+# ---------- HOLDER EXTRACTION ----------
+
+def _get_top_holders(mint: str) -> list:
+    """Returns top holder wallet addresses from GoPlus."""
+    try:
+        r = requests.get(GOPLUS_URL, params={"contract_addresses": mint}, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return []
+        data   = r.json()
+        result = (data.get("result") or {}).get(mint) or (data.get("result") or {}).get(mint.lower())
+        if not result or not isinstance(result, dict):
+            return []
+        holders = result.get("holders") or []
+        addrs   = []
+        for h in holders[:10]:
+            if not isinstance(h, dict):
+                continue
+            addr = h.get("address") or ""
+            if (addr and SOLANA_MINT_RE.match(addr) and addr not in SKIP_ADDRESSES):
+                addrs.append(addr)
+        return addrs
+    except Exception:
+        return []
 
 
 # ---------- ACTIVITY VERIFIER ----------
 
-def _is_wallet_active(address: str, days: int = ACTIVITY_DAYS) -> bool:
-    """
-    Returns True if wallet has at least 1 Solana transaction in the last `days` days.
-    Uses getSignaturesForAddress — public RPC, no auth.
-    """
-    cutoff = int(time.time()) - (days * 86400)
+def _is_active(address: str) -> bool:
+    """True if wallet has at least 1 tx in last ACTIVITY_DAYS days."""
+    cutoff = int(time.time()) - (ACTIVITY_DAYS * 86400)
     try:
         r = requests.post(
             SOLANA_RPC,
             json={
-                "jsonrpc": "2.0",
-                "id":      1,
+                "jsonrpc": "2.0", "id": 1,
                 "method":  "getSignaturesForAddress",
                 "params":  [address, {"limit": 1, "commitment": "confirmed"}],
             },
             timeout=TIMEOUT,
         )
-        if r.status_code != 200:
-            return False
-        sigs = r.json().get("result") or []
-        if not sigs:
-            return False
-        block_time = sigs[0].get("blockTime") or 0
-        return block_time >= cutoff
+        sigs = (r.json().get("result") or []) if r.status_code == 200 else []
+        return bool(sigs) and (sigs[0].get("blockTime") or 0) >= cutoff
     except Exception:
         return False
 
 
-# ---------- QUALITY FILTER ----------
-
-def _passes_quality(w: dict) -> bool:
-    """Returns True if wallet meets minimum quality thresholds."""
-    if w.get("win_rate", 0) < MIN_WIN_RATE:
-        return False
-    if w.get("pnl_30d", 0) < MIN_PNL_30D:
-        return False
-    if w.get("trades_30d", 0) < MIN_TRADES_30D:
-        return False
-    return True
-
-
-# ---------- MAIN DISCOVERY ----------
+# ---------- MAIN ----------
 
 def discover_wallets(progress_callback=None) -> dict:
-    """
-    Full discovery run. Returns {added: int, skipped_quality: int,
-    skipped_inactive: int, skipped_duplicate: int, total_checked: int, sources: dict}.
-
-    progress_callback(msg: str) — called with status updates during the run.
-    """
-    def _progress(msg):
+    """Full discovery run. Returns stats dict."""
+    def _p(msg):
         if progress_callback:
             progress_callback(msg)
         log.info(msg)
 
-    already_tracked = {w["address"].lower() for w in load_wallets()}
+    already = {w["address"].lower() for w in load_wallets()}
 
-    # Step 1: collect candidates from all sources
-    _progress("🔍 Fetching from GMGN rank...")
-    candidates = _fetch_gmgn_rank(limit=50)
+    # Step 1: winning tokens
+    _p("🔍 Finding recently successful Solana tokens from GeckoTerminal...")
+    tokens = _get_successful_tokens(limit=30)
+    if not tokens:
+        _p("⚠️ No tokens found. Retrying in 5s...")
+        time.sleep(5)
+        tokens = _get_successful_tokens(limit=30)
 
-    _progress("🔍 Fetching from GMGN smart money / KOL tags...")
-    candidates += _fetch_gmgn_smart(limit=50)
+    if not tokens:
+        return {"added": 0, "skipped_quality": 0, "skipped_inactive": 0,
+                "skipped_duplicate": 0, "total_checked": 0, "sources": {},
+                "error": "GeckoTerminal returned no qualifying tokens"}
 
-    # Dedupe by address (keep first occurrence)
-    seen = set()
-    unique = []
-    for w in candidates:
-        addr = w["address"].lower()
-        if addr not in seen:
-            seen.add(addr)
-            unique.append(w)
+    _p(f"📋 {len(tokens)} winning tokens found. Fetching top holders for each...")
 
-    _progress(f"📋 {len(unique)} unique candidates found. Filtering...")
+    # Step 2: collect holder hits per wallet
+    wallet_hits: dict = {}
 
-    # Step 2: quality filter
-    quality_passed = [w for w in unique if _passes_quality(w)]
-    skipped_quality = len(unique) - len(quality_passed)
+    for i, tok in enumerate(tokens):
+        holders = _get_top_holders(tok["mint"])
+        sym     = tok.get("symbol") or tok["mint"][:6]
+        for addr in holders:
+            if addr.lower() in already:
+                continue
+            if addr not in wallet_hits:
+                wallet_hits[addr] = {"count": 0, "tokens": []}
+            wallet_hits[addr]["count"]  += 1
+            wallet_hits[addr]["tokens"].append(sym)
+        if (i + 1) % 5 == 0:
+            _p(f"⏳ {i+1}/{len(tokens)} tokens processed — {len(wallet_hits)} unique wallets seen so far")
+        time.sleep(0.4)   # respect GoPlus ~20 req/s free limit
 
-    # Step 3: skip already-tracked
-    not_duplicate = [w for w in quality_passed if w["address"].lower() not in already_tracked]
-    skipped_duplicate = len(quality_passed) - len(not_duplicate)
+    _p(f"👥 {len(wallet_hits)} unique wallets found. Filtering by multi-token presence...")
 
-    # Cap to avoid hammering RPC
-    to_check = not_duplicate[:MAX_WALLETS]
-
-    _progress(
-        f"✅ {len(quality_passed)} passed quality filter "
-        f"({skipped_quality} failed, {skipped_duplicate} already tracked). "
-        f"Verifying {len(to_check)} wallets for activity..."
+    # Step 3: keep only wallets that appeared in 2+ tokens
+    candidates = sorted(
+        [(a, info) for a, info in wallet_hits.items() if info["count"] >= MIN_TOKEN_HITS],
+        key=lambda x: x[1]["count"],
+        reverse=True,
     )
+    skipped_quality = len(wallet_hits) - len(candidates)
 
-    # Step 4: activity check (sequential with small delay to respect public RPC)
+    if not candidates:
+        _p(
+            "⚠️ No wallets appeared in 2+ winning tokens. "
+            "Market may be slow — try again in a few hours when more tokens have graduated."
+        )
+        return {"added": 0, "skipped_quality": skipped_quality, "skipped_inactive": 0,
+                "skipped_duplicate": len(already), "total_checked": 0, "sources": {}}
+
+    _p(f"⭐ {len(candidates)} wallets in top-holders of 2+ winning tokens. Verifying activity on-chain...")
+
+    # Step 4: parallel activity check
     added = 0
     skipped_inactive = 0
-    source_counts = {}
 
-    for i, w in enumerate(to_check):
-        if i > 0 and i % 10 == 0:
-            _progress(f"⏳ Checked {i}/{len(to_check)}... ({added} added so far)")
-            time.sleep(1)  # brief pause every 10 to avoid rate-limit
-
-        if not _is_wallet_active(w["address"]):
-            skipped_inactive += 1
-            continue
-
-        label = _make_label(w)
-        source = w.get("source", "discovery")
-        ok = add_wallet(w["address"], label, source=source)
-        if ok:
-            added += 1
-            source_counts[source] = source_counts.get(source, 0) + 1
-        time.sleep(0.15)  # ~6 req/s — well within public RPC limits
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {ex.submit(_is_active, addr): (addr, info) for addr, info in candidates}
+        for future in as_completed(future_map):
+            addr, info = future_map[future]
+            try:
+                if not future.result():
+                    skipped_inactive += 1
+                    continue
+                tokens_str = "-".join(info["tokens"][:2])
+                label = f"disc-{info['count']}x-{tokens_str}"[:40]
+                if add_wallet(addr, label, source="auto-discovery"):
+                    added += 1
+            except Exception:
+                skipped_inactive += 1
 
     return {
-        "added":            added,
-        "skipped_quality":  skipped_quality,
-        "skipped_inactive": skipped_inactive,
-        "skipped_duplicate": skipped_duplicate,
-        "total_checked":    len(to_check),
-        "sources":          source_counts,
+        "added":             added,
+        "skipped_quality":   skipped_quality,
+        "skipped_inactive":  skipped_inactive,
+        "skipped_duplicate": len(already),
+        "total_checked":     len(candidates),
+        "sources":           {"gecko+goplus": added},
     }
-
-
-def _make_label(w: dict) -> str:
-    """Generate a readable label from wallet stats."""
-    wr  = w.get("win_rate", 0)
-    pnl = w.get("pnl_30d", 0)
-    src = w.get("source", "disc").replace("gmgn-", "")
-
-    pnl_str = f"${pnl/1000:.0f}k" if pnl >= 1000 else f"${pnl:.0f}"
-    return f"{src}-{int(wr*100)}pct-{pnl_str}"
