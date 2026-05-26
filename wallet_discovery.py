@@ -1,15 +1,15 @@
 """
-Wallet Discovery — finds active profitable wallets using only public Solana RPC + GeckoTerminal.
+Wallet Discovery — finds active profitable wallets using public Solana RPC + GeckoTerminal.
 
 Strategy:
-  1. Pull up to 60 Solana tokens from GeckoTerminal (trending + new pools, loose filters)
+  1. Pull Solana tokens from GeckoTerminal (trending + new, loose filters)
   2. For each token, get top holders via Solana RPC getTokenLargestAccounts
-     (resolves each token account to its owner wallet address)
-  3. Wallets appearing as top holder in 2+ different tokens = smart money candidate
-  4. Verify activity: must have tx in last 7 days
+     then resolve each token account (ATA) to its owner wallet via getAccountInfo
+  3. Wallets appearing as top holder in 2+ tokens = smart money candidate
+  4. Verify each wallet has on-chain activity in last 7 days
   5. Add to smart_wallets.json
 
-100% free, no auth, no Cloudflare. All public RPC.
+Free, no auth, no Cloudflare. All public Solana RPC.
 """
 
 import requests
@@ -24,40 +24,54 @@ log = logging.getLogger(__name__)
 SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
 GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 GECKO_NEW      = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-TIMEOUT        = 10
+TIMEOUT        = 12
 ACTIVITY_DAYS  = 7
 MIN_TOKEN_HITS = 2
-MAX_WORKERS    = 6
+MAX_WORKERS    = 5
 SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-# Known non-wallet addresses to skip
 SKIP_ADDRESSES = {
     "11111111111111111111111111111111",
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
     "So11111111111111111111111111111111111111112",
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
     "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bNX",
     "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-    "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",  # serum dex
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # raydium v4
-    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # raydium authority
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+    "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
 }
+
+
+# ---------- RPC helper ----------
+
+def _rpc(method: str, params: list):
+    """POST to Solana RPC. Returns result or None. Logs errors."""
+    try:
+        r = requests.post(
+            SOLANA_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=TIMEOUT,
+        )
+        body = r.json()
+        if "error" in body:
+            log.warning(f"RPC {method} error: {body['error']}")
+            return None
+        return body.get("result")
+    except Exception as e:
+        log.warning(f"RPC {method} exception: {e}")
+        return None
 
 
 # ---------- TOKEN DISCOVERY ----------
 
 def _get_tokens(limit: int = 60) -> list:
-    """
-    Returns Solana token mints from GeckoTerminal trending + new pools.
-    Filters loosened: any token with liq > $5K and vol > $500 and positive price.
-    """
     tokens = []
     seen   = set()
 
-    for url, page_count in ((GECKO_TRENDING, 2), (GECKO_NEW, 3)):
-        for page in range(1, page_count + 1):
+    for url in (GECKO_TRENDING, GECKO_NEW):
+        for page in range(1, 4):
             try:
                 r = requests.get(
                     url,
@@ -85,28 +99,21 @@ def _get_tokens(limit: int = 60) -> list:
                     vol = float((attr.get("volume_usd") or {}).get("h24") or 0)
                     pc  = float((attr.get("price_change_percentage") or {}).get("h24") or 0)
 
-                    # Very loose filters — just needs to be alive
-                    if liq < 5_000:
-                        continue
-                    if vol < 500:
-                        continue
-                    if pc <= 0:
+                    if liq < 5_000 or vol < 500 or pc <= 0:
                         continue
 
                     tokens.append({
                         "mint":   mint,
                         "symbol": (attr.get("name") or mint[:6]).split("/")[0].strip(),
-                        "liq":    liq,
-                        "vol":    vol,
                     })
 
                     if len(tokens) >= limit:
                         break
 
-                time.sleep(0.5)   # GeckoTerminal: 30 req/min free
+                time.sleep(0.6)
 
             except Exception as e:
-                log.warning(f"GeckoTerminal {url} page {page}: {e}")
+                log.warning(f"GeckoTerminal error: {e}")
                 break
 
             if len(tokens) >= limit:
@@ -120,76 +127,58 @@ def _get_tokens(limit: int = 60) -> list:
 
 # ---------- HOLDER RESOLUTION ----------
 
-def _rpc(method, params):
-    r = requests.post(
-        SOLANA_RPC,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        timeout=TIMEOUT,
-    )
-    return r.json().get("result") if r.status_code == 200 else None
+def _resolve_ata_owner(ata_address: str) -> str:
+    """Returns the owner wallet of a token account (ATA). Empty string on failure."""
+    result = _rpc("getAccountInfo", [ata_address, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+    if not result:
+        return ""
+    value = result.get("value") or {}
+    try:
+        owner = value["data"]["parsed"]["info"]["owner"]
+        if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
+            return owner
+    except (KeyError, TypeError):
+        pass
+    return ""
 
 
 def _get_holder_wallets(mint: str) -> list:
-    """
-    Returns top holder wallet addresses for a token mint using Solana RPC.
-    getTokenLargestAccounts → list of ATAs → resolve each ATA to owner wallet.
-    """
-    try:
-        result = _rpc("getTokenLargestAccounts", [mint, "confirmed"])
-        if not result:
-            return []
-        accounts = result.get("value") or []
-        if not accounts:
-            return []
-
-        # Filter to accounts with meaningful balance
-        atas = [
-            a["address"] for a in accounts[:10]
-            if a.get("uiAmount") and float(a.get("uiAmount") or 0) > 0
-        ]
-        if not atas:
-            return []
-
-        # Batch resolve ATAs to owner wallets via getMultipleAccounts
-        batch_result = _rpc("getMultipleAccounts", [atas, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-        if not batch_result:
-            return []
-
-        owners = []
-        for acct in (batch_result.get("value") or []):
-            if not acct:
-                continue
-            try:
-                owner = (
-                    acct.get("data", {})
-                        .get("parsed", {})
-                        .get("info", {})
-                        .get("owner") or ""
-                )
-                if (owner
-                        and SOLANA_MINT_RE.match(owner)
-                        and owner not in SKIP_ADDRESSES
-                        and len(owner) >= 32):
-                    owners.append(owner)
-            except Exception:
-                continue
-        return owners
-
-    except Exception as e:
-        log.warning(f"Holder resolution failed for {mint[:8]}: {e}")
+    """Returns up to 8 owner wallet addresses for the top holders of a token."""
+    # Step 1: get top token accounts
+    result = _rpc("getTokenLargestAccounts", [mint])
+    if not result:
         return []
+
+    atas = []
+    for acct in (result.get("value") or [])[:8]:
+        addr = acct.get("address") or ""
+        amt  = float(acct.get("uiAmount") or 0)
+        if addr and amt > 0:
+            atas.append(addr)
+
+    if not atas:
+        return []
+
+    # Step 2: resolve each ATA to its owner wallet (parallel)
+    owners = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_resolve_ata_owner, ata): ata for ata in atas}
+        for future in as_completed(futures):
+            owner = future.result()
+            if owner:
+                owners.append(owner)
+
+    return owners
 
 
 # ---------- ACTIVITY CHECK ----------
 
 def _is_active(address: str) -> bool:
     cutoff = int(time.time()) - (ACTIVITY_DAYS * 86400)
-    try:
-        result = _rpc("getSignaturesForAddress", [address, {"limit": 1, "commitment": "confirmed"}])
-        sigs   = result if isinstance(result, list) else []
-        return bool(sigs) and (sigs[0].get("blockTime") or 0) >= cutoff
-    except Exception:
+    result = _rpc("getSignaturesForAddress", [address, {"limit": 1, "commitment": "confirmed"}])
+    if not isinstance(result, list) or not result:
         return False
+    return (result[0].get("blockTime") or 0) >= cutoff
 
 
 # ---------- MAIN ----------
@@ -201,23 +190,24 @@ def discover_wallets(progress_callback=None) -> dict:
 
     already = {w["address"].lower() for w in load_wallets()}
 
-    # Step 1: tokens
-    _p("🔍 Fetching Solana tokens from GeckoTerminal (trending + new pools)...")
+    # Step 1: get tokens
+    _p("🔍 Fetching tokens from GeckoTerminal (trending + new pools)...")
     tokens = _get_tokens(limit=60)
 
     if not tokens:
-        _p("⚠️ GeckoTerminal returned nothing. Check internet/Railway connectivity.")
+        _p("⚠️ No tokens returned by GeckoTerminal. Check Railway internet connectivity.")
         return {"added": 0, "skipped_quality": 0, "skipped_inactive": 0,
                 "skipped_duplicate": len(already), "total_checked": 0, "sources": {}}
 
     _p(f"📋 {len(tokens)} tokens found. Resolving top holders via Solana RPC...")
 
-    # Step 2: collect wallet hits
+    # Step 2: for each token, collect top holder wallets
     wallet_hits: dict = {}
 
     for i, tok in enumerate(tokens):
         owners = _get_holder_wallets(tok["mint"])
         sym    = tok.get("symbol") or tok["mint"][:6]
+
         for addr in owners:
             if addr.lower() in already:
                 continue
@@ -227,27 +217,34 @@ def discover_wallets(progress_callback=None) -> dict:
             wallet_hits[addr]["tokens"].append(sym)
 
         if (i + 1) % 10 == 0:
-            _p(f"⏳ {i+1}/{len(tokens)} tokens done — {len(wallet_hits)} unique wallets so far")
-        time.sleep(0.2)
+            _p(f"⏳ {i+1}/{len(tokens)} tokens done — {len(wallet_hits)} unique wallets found so far")
 
-    _p(f"👥 {len(wallet_hits)} unique wallets found across all tokens.")
+        time.sleep(0.3)
 
-    # Step 3: filter by multi-token presence
+    total_unique = len(wallet_hits)
+    _p(f"👥 {total_unique} unique wallets found across all tokens.")
+
+    # Step 3: keep wallets that appeared in 2+ different tokens
     candidates = sorted(
         [(a, info) for a, info in wallet_hits.items() if info["count"] >= MIN_TOKEN_HITS],
         key=lambda x: x[1]["count"],
         reverse=True,
     )
-    skipped_quality = len(wallet_hits) - len(candidates)
-    _p(f"⭐ {len(candidates)} wallets held tokens across {MIN_TOKEN_HITS}+ winners. Checking activity...")
+    skipped_quality = total_unique - len(candidates)
 
     if not candidates:
-        _p("⚠️ No multi-token wallets found. Market may be thin right now — try again in a few hours.")
-        return {"added": 0, "skipped_quality": skipped_quality, "skipped_inactive": 0,
-                "skipped_duplicate": len(already), "total_checked": 0, "sources": {}}
+        _p(
+            f"⚠️ {total_unique} wallets found but none appeared in {MIN_TOKEN_HITS}+ tokens. "
+            "Lowering threshold to 1 for this run to seed the list..."
+        )
+        # Fall back: take any wallet that appeared at least once, top 30 by nothing
+        candidates = list(wallet_hits.items())[:30]
+        skipped_quality = 0
 
-    # Step 4: parallel activity check
-    added = 0
+    _p(f"⭐ {len(candidates)} candidate wallets. Verifying on-chain activity (last 7 days)...")
+
+    # Step 4: activity check in parallel
+    added            = 0
     skipped_inactive = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
