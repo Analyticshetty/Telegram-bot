@@ -129,38 +129,81 @@ def _get_tokens(limit: int = 60) -> list:
 # ---------- HOLDER RESOLUTION ----------
 
 def _resolve_ata_owner(ata_address: str) -> str:
-    """Returns the owner wallet of a token account (ATA). Empty string on failure."""
+    """Returns the owner wallet of a token account (ATA). Handles both jsonParsed and base64."""
     result = _rpc("getAccountInfo", [ata_address, {"encoding": "jsonParsed", "commitment": "confirmed"}])
     if not result:
         return ""
     value = result.get("value") or {}
-    try:
-        owner = value["data"]["parsed"]["info"]["owner"]
-        if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
-            return owner
-    except (KeyError, TypeError):
-        pass
+    if not value:
+        return ""
+    data = value.get("data")
+    # jsonParsed path
+    if isinstance(data, dict):
+        try:
+            owner = data["parsed"]["info"]["owner"]
+            if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
+                return owner
+        except (KeyError, TypeError):
+            pass
+    # base64 path — SPL token account layout: owner at bytes 32–64
+    if isinstance(data, list) and len(data) >= 1:
+        try:
+            import base64 as _b64
+            raw = _b64.b64decode(data[0])
+            if len(raw) >= 64:
+                owner_bytes = raw[32:64]
+                owner = _base58_encode(owner_bytes)
+                if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
+                    return owner
+        except Exception:
+            pass
     return ""
 
 
-def _get_holder_wallets(mint: str) -> list:
+def _base58_encode(data: bytes) -> str:
+    """Minimal base58 encoder for Solana addresses."""
+    ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    n = int.from_bytes(data, "big")
+    result = ""
+    while n:
+        n, r = divmod(n, 58)
+        result = ALPHABET[r] + result
+    # leading zeros
+    for byte in data:
+        if byte == 0:
+            result = "1" + result
+        else:
+            break
+    return result
+
+
+def _get_holder_wallets(mint: str, debug_callback=None) -> list:
     """Returns up to 8 owner wallet addresses for the top holders of a token."""
-    # Step 1: get top token accounts
     result = _rpc("getTokenLargestAccounts", [mint])
     if not result:
+        if debug_callback:
+            debug_callback(f"⚠️ getTokenLargestAccounts returned None for {mint[:8]}")
         return []
 
+    raw_accounts = result.get("value") or []
+    if debug_callback and not raw_accounts:
+        debug_callback(f"⚠️ getTokenLargestAccounts returned empty value for {mint[:8]}")
+
     atas = []
-    for acct in (result.get("value") or [])[:8]:
+    for acct in raw_accounts[:8]:
         addr = acct.get("address") or ""
         amt  = float(acct.get("uiAmount") or 0)
         if addr and amt > 0:
             atas.append(addr)
 
     if not atas:
+        if debug_callback:
+            debug_callback(
+                f"🔬 Debug {mint[:8]}: {len(raw_accounts)} accounts returned, "
+                f"0 with uiAmount>0. Sample: {str(raw_accounts[:2])[:200]}"
+            )
         return []
 
-    # Step 2: resolve each ATA to its owner wallet (parallel)
     owners = []
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(_resolve_ata_owner, ata): ata for ata in atas}
@@ -168,6 +211,9 @@ def _get_holder_wallets(mint: str) -> list:
             owner = future.result()
             if owner:
                 owners.append(owner)
+
+    if debug_callback:
+        debug_callback(f"🔬 Debug {mint[:8]}: {len(atas)} ATAs → {len(owners)} owners resolved")
 
     return owners
 
@@ -206,7 +252,9 @@ def discover_wallets(progress_callback=None) -> dict:
     wallet_hits: dict = {}
 
     for i, tok in enumerate(tokens):
-        owners = _get_holder_wallets(tok["mint"])
+        # Pass debug callback for first 3 tokens to diagnose RPC issues
+        dbg = _p if i < 3 else None
+        owners = _get_holder_wallets(tok["mint"], debug_callback=dbg)
         sym    = tok.get("symbol") or tok["mint"][:6]
 
         for addr in owners:
