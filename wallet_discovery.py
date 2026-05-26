@@ -15,7 +15,6 @@ import requests
 import time
 import re
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from smart_wallets import add_wallet, load_wallets
 
 log = logging.getLogger(__name__)
@@ -24,9 +23,7 @@ HELIUS_API_KEY  = os.environ.get("HELIUS_API_KEY", "")
 GECKO_TRENDING  = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 TIMEOUT         = 12
 GECKO_TIMEOUT   = 8
-ACTIVITY_DAYS   = 7
 MIN_TOKEN_HITS  = 2
-MAX_WORKERS     = 5
 TARGET_TOKENS   = 200
 HOLDERS_PER_TOKEN = 100
 SOLANA_MINT_RE  = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -148,28 +145,6 @@ def _get_holder_wallets(mint: str, debug_callback=None) -> list:
         return []
 
 
-# ---------- ACTIVITY CHECK ----------
-
-def _is_active(address: str) -> bool:
-    cutoff = int(time.time()) - (ACTIVITY_DAYS * 86400)
-    try:
-        r = requests.post(
-            _helius_url(),
-            json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getSignaturesForAddress",
-                "params": [address, {"limit": 1, "commitment": "confirmed"}],
-            },
-            timeout=TIMEOUT,
-        )
-        result = r.json().get("result")
-        if not isinstance(result, list) or not result:
-            return False
-        return (result[0].get("blockTime") or 0) >= cutoff
-    except Exception:
-        return False
-
-
 # ---------- MAIN ----------
 
 def discover_wallets(progress_callback=None) -> dict:
@@ -240,29 +215,18 @@ def discover_wallets(progress_callback=None) -> dict:
             "skipped_duplicate": len(already), "total_checked": 0, "sources": {"helius": 0},
         }
 
-    # Activity check
-    added            = 0
-    skipped_inactive = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        future_map = {ex.submit(_is_active, addr): (addr, info) for addr, info in candidates}
-        for future in as_completed(future_map):
-            addr, info = future_map[future]
-            try:
-                if not future.result():
-                    skipped_inactive += 1
-                    continue
-                sym_str = "-".join(info["tokens"][:3])
-                label   = f"disc-{info['count']}x-{sym_str}"[:40]
-                if add_wallet(addr, label, source="auto-discovery"):
-                    added += 1
-            except Exception:
-                skipped_inactive += 1
+    # Add all candidates — active or not. An inactive wallet that suddenly buys is a stronger signal.
+    added = 0
+    for addr, info in candidates:
+        sym_str = "-".join(info["tokens"][:3])
+        label   = f"disc-{info['count']}x-{sym_str}"[:40]
+        if add_wallet(addr, label, source="auto-discovery"):
+            added += 1
 
     return {
         "added":             added,
         "skipped_quality":   skipped_quality,
-        "skipped_inactive":  skipped_inactive,
+        "skipped_inactive":  0,
         "skipped_duplicate": len(already),
         "total_checked":     len(candidates),
         "sources":           {"helius": added},
