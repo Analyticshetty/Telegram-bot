@@ -182,38 +182,55 @@ def _get_holder_wallets(mint: str, debug_callback=None) -> list:
     result = _rpc("getTokenLargestAccounts", [mint])
     if not result:
         if debug_callback:
-            debug_callback(f"⚠️ getTokenLargestAccounts returned None for {mint[:8]}")
+            debug_callback(f"⚠️ getTokenLargestAccounts failed for {mint[:8]}")
         return []
 
     raw_accounts = result.get("value") or []
-    if debug_callback and not raw_accounts:
-        debug_callback(f"⚠️ getTokenLargestAccounts returned empty value for {mint[:8]}")
-
-    atas = []
-    for acct in raw_accounts[:8]:
-        addr = acct.get("address") or ""
-        amt  = float(acct.get("uiAmount") or 0)
-        if addr and amt > 0:
-            atas.append(addr)
+    atas = [
+        acct["address"] for acct in raw_accounts[:8]
+        if acct.get("address") and float(acct.get("uiAmount") or 0) > 0
+    ]
 
     if not atas:
         if debug_callback:
             debug_callback(
-                f"🔬 Debug {mint[:8]}: {len(raw_accounts)} accounts returned, "
-                f"0 with uiAmount>0. Sample: {str(raw_accounts[:2])[:200]}"
+                f"🔬 {mint[:8]}: {len(raw_accounts)} accounts, 0 with uiAmount>0. "
+                f"Sample: {str(raw_accounts[:2])[:200]}"
             )
         return []
 
+    # Single batch call instead of N concurrent getAccountInfo calls.
+    # Concurrent calls hammer the public RPC rate limiter — this is 8x cheaper.
+    batch = _rpc("getMultipleAccounts", [atas, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+    if not batch:
+        if debug_callback:
+            debug_callback(f"🔬 {mint[:8]}: getMultipleAccounts failed for {len(atas)} ATAs")
+        return []
+
     owners = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_resolve_ata_owner, ata): ata for ata in atas}
-        for future in as_completed(futures):
-            owner = future.result()
-            if owner:
-                owners.append(owner)
+    for acct_info in (batch.get("value") or []):
+        if not acct_info:
+            continue
+        data = acct_info.get("data")
+        owner = None
+        if isinstance(data, dict):
+            try:
+                owner = data["parsed"]["info"]["owner"]
+            except (KeyError, TypeError):
+                pass
+        elif isinstance(data, list) and data:
+            try:
+                import base64 as _b64
+                raw = _b64.b64decode(data[0])
+                if len(raw) >= 64:
+                    owner = _base58_encode(raw[32:64])
+            except Exception:
+                pass
+        if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
+            owners.append(owner)
 
     if debug_callback:
-        debug_callback(f"🔬 Debug {mint[:8]}: {len(atas)} ATAs → {len(owners)} owners resolved")
+        debug_callback(f"🔬 {mint[:8]}: {len(atas)} ATAs → {len(owners)} owners via batch RPC")
 
     return owners
 
