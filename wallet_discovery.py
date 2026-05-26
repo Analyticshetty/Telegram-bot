@@ -1,15 +1,13 @@
 """
-Wallet Discovery — finds active profitable wallets using public Solana RPC + GeckoTerminal.
+Wallet Discovery — finds active profitable wallets using Solscan + GeckoTerminal.
 
 Strategy:
-  1. Pull Solana tokens from GeckoTerminal (trending + new, loose filters)
-  2. For each token, get top holders via Solana RPC getTokenLargestAccounts
-     then resolve each token account (ATA) to its owner wallet via getAccountInfo
+  1. Pull Solana tokens from GeckoTerminal (trending + new)
+  2. For each token, get top holders via Solscan free API
+     Solscan returns OWNER wallets directly — no ATA resolution, no Solana RPC
   3. Wallets appearing as top holder in 2+ tokens = smart money candidate
-  4. Verify each wallet has on-chain activity in last 7 days
+  4. Verify activity via Solana RPC getSignaturesForAddress (1 call per candidate)
   5. Add to smart_wallets.json
-
-Free, no auth, no Cloudflare. All public Solana RPC.
 """
 
 import requests
@@ -24,8 +22,9 @@ log = logging.getLogger(__name__)
 SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
 GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 GECKO_NEW      = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-TIMEOUT        = 8
-GECKO_TIMEOUT  = 6   # GeckoTerminal specifically — shorter, fail fast
+SOLSCAN_HOLDERS = "https://public-api.solscan.io/token/holders"
+TIMEOUT        = 10
+GECKO_TIMEOUT  = 6
 ACTIVITY_DAYS  = 7
 MIN_TOKEN_HITS = 2
 MAX_WORKERS    = 5
@@ -45,10 +44,9 @@ SKIP_ADDRESSES = {
 }
 
 
-# ---------- RPC helper ----------
+# ---------- Solana RPC (only used for activity check) ----------
 
 def _rpc(method: str, params: list):
-    """POST to Solana RPC. Returns result or None. Logs errors."""
     try:
         r = requests.post(
             SOLANA_RPC,
@@ -57,11 +55,9 @@ def _rpc(method: str, params: list):
         )
         body = r.json()
         if "error" in body:
-            log.warning(f"RPC {method} error: {body['error']}")
             return None
         return body.get("result")
-    except Exception as e:
-        log.warning(f"RPC {method} exception: {e}")
+    except Exception:
         return None
 
 
@@ -72,7 +68,7 @@ def _get_tokens(limit: int = 60) -> list:
     seen   = set()
 
     for url in (GECKO_TRENDING, GECKO_NEW):
-        for page in range(1, 3):   # max 2 pages per source
+        for page in range(1, 3):
             try:
                 r = requests.get(
                     url,
@@ -126,113 +122,44 @@ def _get_tokens(limit: int = 60) -> list:
     return tokens[:limit]
 
 
-# ---------- HOLDER RESOLUTION ----------
-
-def _resolve_ata_owner(ata_address: str) -> str:
-    """Returns the owner wallet of a token account (ATA). Handles both jsonParsed and base64."""
-    result = _rpc("getAccountInfo", [ata_address, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-    if not result:
-        return ""
-    value = result.get("value") or {}
-    if not value:
-        return ""
-    data = value.get("data")
-    # jsonParsed path
-    if isinstance(data, dict):
-        try:
-            owner = data["parsed"]["info"]["owner"]
-            if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
-                return owner
-        except (KeyError, TypeError):
-            pass
-    # base64 path — SPL token account layout: owner at bytes 32–64
-    if isinstance(data, list) and len(data) >= 1:
-        try:
-            import base64 as _b64
-            raw = _b64.b64decode(data[0])
-            if len(raw) >= 64:
-                owner_bytes = raw[32:64]
-                owner = _base58_encode(owner_bytes)
-                if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
-                    return owner
-        except Exception:
-            pass
-    return ""
-
-
-def _base58_encode(data: bytes) -> str:
-    """Minimal base58 encoder for Solana addresses."""
-    ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    n = int.from_bytes(data, "big")
-    result = ""
-    while n:
-        n, r = divmod(n, 58)
-        result = ALPHABET[r] + result
-    # leading zeros
-    for byte in data:
-        if byte == 0:
-            result = "1" + result
-        else:
-            break
-    return result
-
+# ---------- HOLDER LOOKUP via Solscan ----------
 
 def _get_holder_wallets(mint: str, debug_callback=None) -> list:
-    """Returns up to 8 owner wallet addresses for the top holders of a token."""
-    result = _rpc("getTokenLargestAccounts", [mint])
-    if not result:
+    """
+    Returns up to 10 owner wallet addresses using Solscan free holder API.
+    Solscan returns actual wallet owners — no ATA resolution, no Solana RPC calls.
+    """
+    try:
+        r = requests.get(
+            SOLSCAN_HOLDERS,
+            params={"tokenAddress": mint, "limit": 10, "offset": 0},
+            headers={"accept": "application/json", "User-Agent": "Mozilla/5.0"},
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            if debug_callback:
+                debug_callback(f"🔬 {mint[:8]}: Solscan HTTP {r.status_code}")
+            return []
+
+        data = r.json().get("data") or []
+        owners = []
+        for item in data:
+            # Solscan returns 'owner' = actual wallet, 'address' = token account (ATA)
+            addr = item.get("owner") or ""
+            if not addr:
+                addr = item.get("address") or ""
+            if addr and SOLANA_MINT_RE.match(addr) and addr not in SKIP_ADDRESSES:
+                owners.append(addr)
+
         if debug_callback:
-            debug_callback(f"⚠️ getTokenLargestAccounts failed for {mint[:8]}")
-        return []
+            debug_callback(f"🔬 {mint[:8]}: Solscan → {len(owners)} holders")
 
-    raw_accounts = result.get("value") or []
-    atas = [
-        acct["address"] for acct in raw_accounts[:8]
-        if acct.get("address") and float(acct.get("uiAmount") or 0) > 0
-    ]
+        return owners
 
-    if not atas:
+    except Exception as e:
         if debug_callback:
-            debug_callback(
-                f"🔬 {mint[:8]}: {len(raw_accounts)} accounts, 0 with uiAmount>0. "
-                f"Sample: {str(raw_accounts[:2])[:200]}"
-            )
+            debug_callback(f"🔬 {mint[:8]}: Solscan error: {e}")
         return []
-
-    # Single batch call instead of N concurrent getAccountInfo calls.
-    # Concurrent calls hammer the public RPC rate limiter — this is 8x cheaper.
-    batch = _rpc("getMultipleAccounts", [atas, {"encoding": "jsonParsed", "commitment": "confirmed"}])
-    if not batch:
-        if debug_callback:
-            debug_callback(f"🔬 {mint[:8]}: getMultipleAccounts failed for {len(atas)} ATAs")
-        return []
-
-    owners = []
-    for acct_info in (batch.get("value") or []):
-        if not acct_info:
-            continue
-        data = acct_info.get("data")
-        owner = None
-        if isinstance(data, dict):
-            try:
-                owner = data["parsed"]["info"]["owner"]
-            except (KeyError, TypeError):
-                pass
-        elif isinstance(data, list) and data:
-            try:
-                import base64 as _b64
-                raw = _b64.b64decode(data[0])
-                if len(raw) >= 64:
-                    owner = _base58_encode(raw[32:64])
-            except Exception:
-                pass
-        if owner and SOLANA_MINT_RE.match(owner) and owner not in SKIP_ADDRESSES:
-            owners.append(owner)
-
-    if debug_callback:
-        debug_callback(f"🔬 {mint[:8]}: {len(atas)} ATAs → {len(owners)} owners via batch RPC")
-
-    return owners
 
 
 # ---------- ACTIVITY CHECK ----------
@@ -263,16 +190,19 @@ def discover_wallets(progress_callback=None) -> dict:
         return {"added": 0, "skipped_quality": 0, "skipped_inactive": 0,
                 "skipped_duplicate": len(already), "total_checked": 0, "sources": {}}
 
-    _p(f"📋 {len(tokens)} tokens found. Resolving top holders via Solana RPC...")
+    _p(f"📋 {len(tokens)} tokens found. Fetching top holders via Solscan...")
 
     # Step 2: for each token, collect top holder wallets
     wallet_hits: dict = {}
+    solscan_errors = 0
 
     for i, tok in enumerate(tokens):
-        # Pass debug callback for first 3 tokens to diagnose RPC issues
-        dbg = _p if i < 3 else None
+        dbg = _p if i < 5 else None
         owners = _get_holder_wallets(tok["mint"], debug_callback=dbg)
         sym    = tok.get("symbol") or tok["mint"][:6]
+
+        if not owners and i < 5:
+            solscan_errors += 1
 
         for addr in owners:
             if addr.lower() in already:
@@ -283,14 +213,25 @@ def discover_wallets(progress_callback=None) -> dict:
             wallet_hits[addr]["tokens"].append(sym)
 
         if (i + 1) % 10 == 0:
-            _p(f"⏳ {i+1}/{len(tokens)} tokens done — {len(wallet_hits)} unique wallets found so far")
+            _p(f"⏳ {i+1}/{len(tokens)} tokens done — {len(wallet_hits)} unique wallets so far")
 
-        time.sleep(0.3)
+        time.sleep(0.5)
 
     total_unique = len(wallet_hits)
-    _p(f"👥 {total_unique} unique wallets found across all tokens.")
 
-    # Step 3: keep wallets that appeared in 2+ different tokens
+    if total_unique == 0:
+        if solscan_errors >= 3:
+            _p("❌ Solscan API blocked or down. Try: /addwallet <addr> <label> manually.")
+        else:
+            _p(f"⚠️ {len(tokens)} tokens checked, 0 new unique wallets found (all may be already tracked or filtered).")
+        return {
+            "added": 0, "skipped_quality": 0, "skipped_inactive": 0,
+            "skipped_duplicate": len(already), "total_checked": 0, "sources": {"solscan": 0},
+        }
+
+    _p(f"👥 {total_unique} unique wallets across all tokens.")
+
+    # Step 3: keep wallets appearing in 2+ tokens
     candidates = sorted(
         [(a, info) for a, info in wallet_hits.items() if info["count"] >= MIN_TOKEN_HITS],
         key=lambda x: x[1]["count"],
@@ -299,17 +240,13 @@ def discover_wallets(progress_callback=None) -> dict:
     skipped_quality = total_unique - len(candidates)
 
     if not candidates:
-        _p(
-            f"⚠️ {total_unique} wallets found but none appeared in {MIN_TOKEN_HITS}+ tokens. "
-            "Lowering threshold to 1 for this run to seed the list..."
-        )
-        # Fall back: take any wallet that appeared at least once, top 30 by nothing
+        _p(f"⚠️ {total_unique} wallets found but none in 2+ tokens — lowering to 1 for this run...")
         candidates = list(wallet_hits.items())[:30]
         skipped_quality = 0
 
-    _p(f"⭐ {len(candidates)} candidate wallets. Verifying on-chain activity (last 7 days)...")
+    _p(f"⭐ {len(candidates)} candidates. Checking on-chain activity (last 7 days)...")
 
-    # Step 4: activity check in parallel
+    # Step 4: activity check
     added            = 0
     skipped_inactive = 0
 
@@ -334,5 +271,5 @@ def discover_wallets(progress_callback=None) -> dict:
         "skipped_inactive":  skipped_inactive,
         "skipped_duplicate": len(already),
         "total_checked":     len(candidates),
-        "sources":           {"gecko+rpc": added},
+        "sources":           {"solscan": added},
     }
