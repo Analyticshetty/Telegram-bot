@@ -4,6 +4,7 @@ import sqlite3
 import json
 import os
 import base64
+import threading
 from rug_check import check_token, format_report, is_valid_solana_mint
 from tools import TOOLS_SCHEMA, execute_tool
 from scanner import scan as run_scan, format_scan_results
@@ -248,15 +249,17 @@ def handle_listwallets(message):
 def handle_discover(message):
     if not owner_only(message):
         return
-    bot.reply_to(
-        message,
-        "🔍 Starting wallet discovery...\n"
-        "Fetching from GMGN + verifying each wallet is active on-chain.\n"
-        "This takes 2–4 minutes. I'll update you as I go.",
-        parse_mode="Markdown",
-    )
 
     chat_id = message.chat.id
+
+    bot.reply_to(
+        message,
+        "🔍 *Wallet discovery started in background.*\n"
+        "Bot stays fully responsive while this runs.\n"
+        "I'll message you with progress + final results.\n"
+        "Takes 3–8 minutes.",
+        parse_mode="Markdown",
+    )
 
     def progress(msg):
         try:
@@ -264,41 +267,44 @@ def handle_discover(message):
         except Exception:
             pass
 
-    try:
-        result = discover_wallets(progress_callback=progress)
+    def _run():
+        try:
+            result = discover_wallets(progress_callback=progress)
 
-        added    = result["added"]
-        total    = len(load_wallets())
-        sources  = result["sources"]
-        src_str  = ", ".join(f"{k}: {v}" for k, v in sources.items()) if sources else "none"
+            added   = result["added"]
+            total   = len(load_wallets())
+            src_str = ", ".join(f"{k}: {v}" for k, v in result["sources"].items()) if result.get("sources") else "gecko+rpc"
 
-        summary = (
-            f"✅ *Discovery complete!*\n\n"
-            f"🐋 *{added} new wallets added* (total: {total})\n"
-            f"❌ {result['skipped_quality']} failed quality filter (win rate / PNL / trades)\n"
-            f"😴 {result['skipped_inactive']} inactive (no tx in 7 days)\n"
-            f"♻️ {result['skipped_duplicate']} already in your list\n\n"
-            f"Sources: {src_str}\n\n"
-            f"Run `/listwallets` to see the full list.\n"
-            f"Run `/discoverwallet` again anytime to refresh."
-        )
-
-        if added == 0:
-            summary += (
-                "\n\n⚠️ *0 added — GMGN may have blocked the request.*\n"
-                "This happens if their API changes or rate-limits kick in.\n"
-                "Try again in 10 minutes or add wallets manually via `/addwallet`."
+            summary = (
+                f"✅ *Discovery complete!*\n\n"
+                f"🐋 *{added} new wallets added* (total now: {total})\n"
+                f"❌ {result.get('skipped_quality', 0)} didn't appear in 2+ tokens\n"
+                f"😴 {result.get('skipped_inactive', 0)} inactive (no tx in 7 days)\n"
+                f"♻️ {result.get('skipped_duplicate', 0)} already tracked\n\n"
+                f"Source: {src_str}\n"
+                f"Run `/listwallets` to see the full list."
             )
 
-        bot.send_message(chat_id, summary, parse_mode="Markdown")
+            if added == 0:
+                summary += (
+                    "\n\n⚠️ *0 added.* Possible reasons:\n"
+                    "• Market slow — few tokens graduated recently\n"
+                    "• Solana RPC rate-limited — try again in 30 min\n"
+                    "• Add manually: `/addwallet <addr> <label>`"
+                )
 
-    except Exception as e:
-        bot.send_message(
-            chat_id,
-            f"⚠️ Discovery failed: `{e.__class__.__name__}: {str(e)[:200]}`\n"
-            "GMGN may have blocked the request. Try again later or use `/addwallet` manually.",
-            parse_mode="Markdown",
-        )
+            bot.send_message(chat_id, summary, parse_mode="Markdown")
+
+        except Exception as e:
+            bot.send_message(
+                chat_id,
+                f"⚠️ Discovery failed: `{e.__class__.__name__}: {str(e)[:300]}`",
+                parse_mode="Markdown",
+            )
+
+    # Run in background thread — never blocks the polling loop
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
 
 
 # ---------- CAPITAL COMMAND ----------

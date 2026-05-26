@@ -24,7 +24,8 @@ log = logging.getLogger(__name__)
 SOLANA_RPC     = "https://api.mainnet-beta.solana.com"
 GECKO_TRENDING = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 GECKO_NEW      = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-TIMEOUT        = 12
+TIMEOUT        = 8
+GECKO_TIMEOUT  = 6   # GeckoTerminal specifically — shorter, fail fast
 ACTIVITY_DAYS  = 7
 MIN_TOKEN_HITS = 2
 MAX_WORKERS    = 5
@@ -71,13 +72,13 @@ def _get_tokens(limit: int = 60) -> list:
     seen   = set()
 
     for url in (GECKO_TRENDING, GECKO_NEW):
-        for page in range(1, 4):
+        for page in range(1, 3):   # max 2 pages per source
             try:
                 r = requests.get(
                     url,
                     params={"page": page},
                     headers={"Accept": "application/json"},
-                    timeout=TIMEOUT,
+                    timeout=GECKO_TIMEOUT,
                 )
                 if r.status_code != 200:
                     break
@@ -110,7 +111,7 @@ def _get_tokens(limit: int = 60) -> list:
                     if len(tokens) >= limit:
                         break
 
-                time.sleep(0.6)
+                time.sleep(0.4)
 
             except Exception as e:
                 log.warning(f"GeckoTerminal error: {e}")
