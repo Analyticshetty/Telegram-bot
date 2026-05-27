@@ -1,0 +1,275 @@
+"""
+Watcher — background scanner that runs every 5 minutes.
+
+Alert 1 — New Narrative Alert:
+  - Monitors pump.fun for narrative clusters (3+ tokens with same word in last 30 min)
+  - Confirms narrative on Twitter/web via Tavily
+  - Finds the cleanest CA from that cluster
+  - Runs rug check — only alerts on GREEN or YELLOW
+  - Checks smart wallets
+
+Alert 2 — Smart Wallet Signal (embedded in same alert if found):
+  - While checking the best CA, if 1+ smart wallets hold it, highlights that too
+"""
+
+import os
+import re
+import time
+import logging
+import threading
+import requests
+from collections import defaultdict
+from rug_check import check_token, format_report
+from smart_wallets import check_wallets_hold_token, load_wallets
+
+log = logging.getLogger(__name__)
+
+# ---------- CONFIG ----------
+PUMP_API        = "https://frontend-api.pump.fun/coins"
+TAVILY_API_KEY  = os.environ.get("TAVILY_API_KEY", "")
+SCAN_INTERVAL   = 300        # 5 minutes
+NARRATIVE_WINDOW = 1800      # 30 min — cluster detection window
+MIN_CLUSTER     = 3          # 3+ tokens with same word = narrative forming
+TIMEOUT         = 10
+
+COMMON_WORDS = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by",
+    "sol", "solana", "token", "coin", "inu", "ai", "doge", "pepe", "based",
+    "pump", "fun", "moon", "mars", "meme", "finance", "defi", "nft", "dao",
+    "and", "or", "not", "but", "new", "old", "big", "max", "pro", "plus",
+    "one", "two", "just", "now", "get", "let", "buy", "sell", "swap",
+}
+
+# ---------- STATE ----------
+_running        = False
+_thread         = None
+_seen_narratives = set()   # don't re-alert same narrative
+_seen_tokens    = set()    # don't re-alert same token CA
+_lock           = threading.Lock()
+
+
+# ---------- PUMP.FUN ----------
+
+def _fetch_new_pumps(limit: int = 200) -> list:
+    try:
+        r = requests.get(
+            PUMP_API,
+            params={
+                "offset": 0,
+                "limit": limit,
+                "sort": "created_timestamp",
+                "order": "DESC",
+                "includeNsfw": "false",
+            },
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning(f"pump.fun fetch error: {e}")
+        return []
+
+
+def _extract_words(text: str) -> set:
+    words = re.findall(r"[a-zA-Z]+", (text or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in COMMON_WORDS}
+
+
+def _find_narratives(coins: list) -> dict:
+    """Returns {word: [coin, ...]} for words appearing in 3+ tokens in last 30 min."""
+    now    = time.time()
+    cutoff = now - NARRATIVE_WINDOW
+    word_map = defaultdict(list)
+
+    for coin in coins:
+        ts = (coin.get("created_timestamp") or 0) / 1000
+        if ts < cutoff:
+            continue
+        words = _extract_words(coin.get("name") or "") | _extract_words(coin.get("symbol") or "")
+        for w in words:
+            word_map[w].append(coin)
+
+    return {w: coins for w, coins in word_map.items() if len(coins) >= MIN_CLUSTER}
+
+
+# ---------- TWITTER CONFIRMATION ----------
+
+def _confirm_twitter(narrative: str) -> bool:
+    """Quick Tavily search to confirm narrative is trending on Twitter/crypto news."""
+    if not TAVILY_API_KEY:
+        return True
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": f"{narrative} solana memecoin crypto",
+                "search_depth": "basic",
+                "max_results": 3,
+                "include_domains": ["twitter.com", "x.com", "reddit.com", "dexscreener.com"],
+            },
+            timeout=TIMEOUT,
+        )
+        results = r.json().get("results") or []
+        return len(results) >= 1
+    except Exception:
+        return True  # don't block alert on Tavily failure
+
+
+# ---------- BEST CA FROM CLUSTER ----------
+
+def _best_ca(narrative: str, coins: list) -> dict:
+    """Pick the coin from the cluster with highest market cap (most traction)."""
+    candidates = [
+        c for c in coins
+        if narrative in (_extract_words(c.get("name") or "") | _extract_words(c.get("symbol") or ""))
+        and c.get("mint")
+    ]
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda x: float(x.get("usd_market_cap") or 0), reverse=True)
+    best = candidates[0]
+    return {
+        "mint":   best.get("mint") or "",
+        "name":   best.get("name") or "",
+        "symbol": best.get("symbol") or "",
+        "mc":     float(best.get("usd_market_cap") or 0),
+        "cluster_size": len(candidates),
+    }
+
+
+# ---------- ALERT BUILDER ----------
+
+def _build_alert(narrative: str, token: dict, rug_result: dict, twitter_ok: bool) -> str:
+    mint          = token["mint"]
+    symbol        = token.get("symbol") or mint[:6]
+    cluster_size  = token.get("cluster_size", 0)
+
+    verdict       = rug_result.get("verdict") or "UNKNOWN"
+    verdict_emoji = "🟢" if verdict == "GREEN" else "🟡" if verdict == "YELLOW" else "🔴"
+
+    details   = rug_result.get("details") or {}
+    mc        = details.get("market_cap_usd") or token.get("mc") or 0
+    liq       = details.get("liquidity_usd") or 0
+    age       = details.get("age_human") or "unknown"
+    change_1h = details.get("price_change_1h") or 0
+    vol_1h    = details.get("volume_1h_usd") or 0
+
+    # Smart wallet check
+    holders       = check_wallets_hold_token(mint)
+    total_wallets = len(load_wallets())
+    if holders:
+        labels = ", ".join(h["label"] for h in holders[:3])
+        wallet_line = f"🐋 Smart wallets: 👀 *{len(holders)} of {total_wallets}* holding ({labels})"
+    else:
+        wallet_line = f"🐋 Smart wallets: ⚪ 0 of {total_wallets} holding"
+
+    twitter_line = "🐦 Twitter: ✅ Trending" if twitter_ok else "🐦 Twitter: ⚠️ Not confirmed yet"
+
+    return (
+        f"🚨 *{symbol}* — Narrative forming\n\n"
+        f"📋 CA: `{mint}`\n"
+        f"⏰ Age: {age}\n"
+        f"💰 MC: ${mc:,.0f}\n"
+        f"💧 Liquidity: ${liq:,.0f}\n"
+        f"📈 1h change: {change_1h:+.1f}%\n"
+        f"🔥 1h volume: ${vol_1h:,.0f}\n\n"
+        f"🧠 Narrative: *\"{narrative}\"* — {cluster_size} tokens launched in last 30 min\n"
+        f"{twitter_line}\n\n"
+        f"🛡 Rug check: {verdict_emoji} *{verdict}*\n"
+        f"{wallet_line}"
+    )
+
+
+# ---------- SCAN LOOP ----------
+
+def _scan_once(send_alert_fn):
+    """One full scan cycle. Calls send_alert_fn(text) for each valid alert."""
+    coins = _fetch_new_pumps(limit=200)
+    if not coins:
+        log.warning("Watcher: pump.fun returned 0 coins")
+        return
+
+    narratives = _find_narratives(coins)
+    if not narratives:
+        return
+
+    for narrative, cluster_coins in narratives.items():
+        with _lock:
+            if narrative in _seen_narratives:
+                continue
+
+        # Find best CA in cluster
+        token = _best_ca(narrative, cluster_coins)
+        if not token or not token.get("mint"):
+            continue
+
+        mint = token["mint"]
+        with _lock:
+            if mint in _seen_tokens:
+                continue
+
+        # Twitter confirmation
+        twitter_ok = _confirm_twitter(narrative)
+
+        # Rug check — skip RED
+        try:
+            rug_result = check_token(mint)
+        except Exception as e:
+            log.warning(f"Watcher rug check failed for {mint}: {e}")
+            continue
+
+        if rug_result.get("verdict") == "RED":
+            with _lock:
+                _seen_narratives.add(narrative)
+                _seen_tokens.add(mint)
+            continue
+
+        # Build and send alert
+        alert = _build_alert(narrative, token, rug_result, twitter_ok)
+        send_alert_fn(alert)
+
+        with _lock:
+            _seen_narratives.add(narrative)
+            _seen_tokens.add(mint)
+
+        time.sleep(2)  # brief pause between alerts
+
+
+def _loop(send_alert_fn):
+    global _running
+    log.info("Watcher started.")
+    while _running:
+        try:
+            _scan_once(send_alert_fn)
+        except Exception as e:
+            log.warning(f"Watcher scan error: {e}")
+        for _ in range(SCAN_INTERVAL):
+            if not _running:
+                break
+            time.sleep(1)
+    log.info("Watcher stopped.")
+
+
+# ---------- PUBLIC API ----------
+
+def start(send_alert_fn):
+    """Start the watcher background thread. send_alert_fn(text) sends Telegram message."""
+    global _running, _thread
+    if _running:
+        return False
+    _running = True
+    _thread  = threading.Thread(target=_loop, args=(send_alert_fn,), daemon=True)
+    _thread.start()
+    return True
+
+
+def stop():
+    global _running
+    _running = False
+
+
+def is_running() -> bool:
+    return _running

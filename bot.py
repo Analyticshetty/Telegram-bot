@@ -5,11 +5,15 @@ import json
 import os
 import base64
 import threading
+import logging
+
+log = logging.getLogger(__name__)
 from rug_check import check_token, format_report, is_valid_solana_mint
 from tools import TOOLS_SCHEMA, execute_tool
 from scanner import scan as run_scan, format_scan_results
 from smart_wallets import add_wallet, remove_wallet, load_wallets, _all_wallets
 from wallet_discovery import discover_wallets
+import watcher as watcher_module
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
@@ -165,7 +169,8 @@ def handle_help(message):
         "🐋 `/addwallet <addr> <label>` — track a wallet.\n"
         "📋 `/listwallets` — show all tracked wallets.\n"
         "❌ `/removewallet <addr>` — stop tracking a wallet.\n"
-        "🔍 `/discoverwallet` — auto-find & add active profitable wallets from GMGN.\n"
+        "🔍 `/discoverwallet` — auto-find smart money wallets.\n"
+        "👁 `/watcher on/off/status` — narrative alert scanner.\n"
         "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
@@ -305,6 +310,57 @@ def handle_discover(message):
     # Run in background thread — never blocks the polling loop
     t = threading.Thread(target=_run, daemon=True)
     t.start()
+
+
+# ---------- WATCHER COMMANDS ----------
+
+def _watcher_alert(text: str):
+    """Send alert to owner."""
+    if not OWNER_TELEGRAM_ID:
+        return
+    try:
+        bot.send_message(
+            OWNER_TELEGRAM_ID,
+            text,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.warning(f"Watcher alert send failed: {e}")
+
+
+@bot.message_handler(commands=['watcher'])
+def handle_watcher(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    action = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if action == "on":
+        if watcher_module.is_running():
+            bot.reply_to(message, "👁 Watcher already running.")
+        else:
+            watcher_module.start(_watcher_alert)
+            bot.reply_to(
+                message,
+                "👁 *Watcher ON* — scanning every 5 min.\n"
+                "Alerts when a narrative forms on pump.fun + Twitter confirms.\n"
+                "Stop with `/watcher off`",
+                parse_mode="Markdown",
+            )
+    elif action == "off":
+        watcher_module.stop()
+        bot.reply_to(message, "🔕 Watcher stopped.")
+    else:
+        status = "✅ Running" if watcher_module.is_running() else "⛔ Stopped"
+        bot.reply_to(
+            message,
+            f"👁 *Watcher status:* {status}\n\n"
+            f"Commands:\n"
+            f"`/watcher on` — start scanning\n"
+            f"`/watcher off` — stop",
+            parse_mode="Markdown",
+        )
 
 
 # ---------- CAPITAL COMMAND ----------
