@@ -12,6 +12,7 @@ underlying on-chain data via GeckoTerminal.
 import requests
 from datetime import datetime, timezone
 from rug_check import check_token
+from trade_card import compute_trade_card, format_trade_card
 
 GECKOTERMINAL_NEW    = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 GECKOTERMINAL_TREND  = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
@@ -21,13 +22,15 @@ TIMEOUT              = 10
 FILTER_DEFAULTS = {
     "min_liquidity_usd":   5000,
     "max_liquidity_usd":   2_000_000,
-    "min_market_cap":      30_000,
+    "min_market_cap":      10_000,        # was 30k — catches earlier launches
     "max_market_cap":      5_000_000,
     "min_age_minutes":     5,
-    "max_age_minutes":     1440,    # 24h
-    "min_volume_1h_usd":   1000,
-    "max_top10_pct":       35.0,
-    "min_buy_ratio_1h":    0.45,    # at least 45% buys
+    "max_age_minutes":     1440,          # 24h
+    "min_volume_1h_usd":   1000,          # applies to tokens older than YOUNG_AGE_MIN
+    "min_volume_5m_usd":   1000,          # NEW — for freshly-launched tokens
+    "young_age_minutes":   60,            # token is "young" until 60min old
+    "max_top10_pct":       50.0,          # was 35 — wider tolerance
+    "min_buy_ratio_1h":    0.45,          # at least 45% buys
 }
 
 
@@ -63,6 +66,7 @@ def extract_pool_info(pool: dict) -> dict:
         except: return None
 
     vol_1h = ((attrs.get("volume_usd") or {}).get("h1"))
+    vol_5m = ((attrs.get("volume_usd") or {}).get("m5"))
     txns_1h = (attrs.get("transactions") or {}).get("h1") or {}
     buys_1h, sells_1h = txns_1h.get("buys") or 0, txns_1h.get("sells") or 0
     buy_ratio = buys_1h / max(buys_1h + sells_1h, 1)
@@ -78,6 +82,7 @@ def extract_pool_info(pool: dict) -> dict:
         "price_change_1h":   f((attrs.get("price_change_percentage") or {}).get("h1")),
         "price_change_24h":  f((attrs.get("price_change_percentage") or {}).get("h24")),
         "volume_1h":         f(vol_1h),
+        "volume_5m":         f(vol_5m),
         "buys_1h":           buys_1h,
         "sells_1h":          sells_1h,
         "buy_ratio_1h":      buy_ratio,
@@ -107,9 +112,17 @@ def passes_pre_filter(info: dict, f=FILTER_DEFAULTS) -> tuple[bool, list]:
         fails.append(f"age < {f['min_age_minutes']}min")
     elif age > f["max_age_minutes"]:
         fails.append(f"age > {f['max_age_minutes']}min")
-    vol = info.get("volume_1h")
-    if vol is None or vol < f["min_volume_1h_usd"]:
-        fails.append(f"1h vol < ${f['min_volume_1h_usd']:,}")
+    # Volume rule depends on age: young tokens use 5m vol (need fast confirmation
+    # of real interest), older tokens use 1h vol.
+    young = age is not None and age <= f["young_age_minutes"]
+    if young:
+        vol5 = info.get("volume_5m")
+        if vol5 is None or vol5 < f["min_volume_5m_usd"]:
+            fails.append(f"5m vol < ${f['min_volume_5m_usd']:,} (young token)")
+    else:
+        vol = info.get("volume_1h")
+        if vol is None or vol < f["min_volume_1h_usd"]:
+            fails.append(f"1h vol < ${f['min_volume_1h_usd']:,}")
     if info.get("buy_ratio_1h", 0) < f["min_buy_ratio_1h"]:
         fails.append(f"buy ratio < {f['min_buy_ratio_1h']:.0%}")
     return (len(fails) == 0, fails)
@@ -174,12 +187,16 @@ def format_scan_results(results: list) -> str:
         vol = r.get("volume_1h") or 0
         pc1 = r.get("price_change_1h") or 0
         age_str = f"{age:.0f}m" if age < 60 else f"{age/60:.1f}h"
-        lines.append(
+        block = (
             f"\n{v_icon} *{i}. {sym}*\n"
             f"`{mint}`\n"
             f"💧 Liq ${liq:,.0f}  |  📈 MC ${mc:,.0f}\n"
-            f"⏱ {age_str}  |  📊 1h vol ${vol:,.0f}  |  {pc1:+.1f}%\n"
+            f"⏱ {age_str}  |  📊 1h vol ${vol:,.0f}  |  {pc1:+.1f}%"
         )
+        card = compute_trade_card(r["verdict"], r.get("price_usd"))
+        if card:
+            block += format_trade_card(card)
+        lines.append(block + "\n")
     lines.append("\n_Paste any CA back to me for a full /check report._")
     lines.append("_Then verify Bitget app shows 'no contract risks detected' before buying._")
     return "\n".join(lines)

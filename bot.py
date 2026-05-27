@@ -192,6 +192,7 @@ def handle_help(message):
         "🔍 `/discoverwallet` — auto-find smart money wallets.\n"
         "👁 `/watcher on/off/status` — narrative alert scanner.\n"
         "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
+        "_Every GREEN/YELLOW report includes a 💼 Trade Card: entry $, TP1 (2x, sell 50%), TP2 (3x), SL (-30%)._\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
     )

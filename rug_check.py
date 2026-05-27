@@ -13,12 +13,14 @@ import requests
 import re
 from datetime import datetime, timezone
 from smart_wallets import format_smart_wallet_section
+from trade_card import trade_card_for_check
 
 RUGCHECK_URL       = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 DEXSCREENER_URL    = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/"
 SOLANA_RPC         = "https://api.mainnet-beta.solana.com"
 GOPLUS_URL         = "https://api.gopluslabs.io/api/v1/solana/token_security"
+GECKO_TOKEN_URL    = "https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}"
 TIMEOUT            = 8
 
 SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -45,6 +47,43 @@ def get_mint_authorities(mint: str):
         return ("UNKNOWN", "UNKNOWN")
     parsed = res["value"]["data"]["parsed"]["info"]
     return (parsed.get("mintAuthority"), parsed.get("freezeAuthority"))
+
+
+def get_token_supply(mint: str):
+    """Returns circulating supply as float (decimals applied), or None on failure.
+    Ground truth — comes straight from Solana RPC, never stale."""
+    try:
+        res = _rpc("getTokenSupply", [mint])
+        if not res or not res.get("value"):
+            return None
+        v = res["value"]
+        ui = v.get("uiAmount")
+        if ui is not None:
+            return float(ui)
+        amount = v.get("amount")
+        decimals = v.get("decimals") or 0
+        if amount is not None:
+            return float(amount) / (10 ** decimals)
+    except Exception:
+        pass
+    return None
+
+
+def get_geckoterminal_price(mint: str):
+    """Fresh price from GeckoTerminal as second source. Returns float or None."""
+    try:
+        r = requests.get(
+            GECKO_TOKEN_URL.format(mint=mint),
+            timeout=TIMEOUT,
+            headers={"Accept": "application/json;version=20230302"},
+        )
+        if r.status_code != 200:
+            return None
+        attrs = ((r.json() or {}).get("data") or {}).get("attributes") or {}
+        p = attrs.get("price_usd")
+        return float(p) if p is not None else None
+    except Exception:
+        return None
 
 
 def get_rugcheck(mint: str):
@@ -95,11 +134,21 @@ def search_by_symbol(symbol: str):
 
 def detect_clone(current_mint: str, current_symbol: str, current_pair: dict):
     """Check if current token is the original or a clone.
-    Returns dict with: is_original (bool), real_ca (str or None), reason, peers (list)."""
+
+    A peer only counts as a serious alternative if it's ALIVE. Dead-but-not-fully-drained
+    rugger pairs were previously promoted as 'the real one' just because their stale liquidity
+    was higher than the current young token's. Now we require recent activity:
+      - volume_24h >= $500, OR
+      - buys+sells in last 24h >= 20
+
+    Otherwise the peer is marked dead and excluded from ranking.
+
+    Returns dict with: is_original (bool), real_ca, reason, peers, dead_peer_count."""
     if not current_symbol:
         return {"is_original": None, "real_ca": None, "reason": "no symbol", "peers": []}
     peers = search_by_symbol(current_symbol)
-    # Group by mint (DEXScreener may return multiple pairs per token)
+
+    # Group by mint, keep the pair with highest liquidity per mint, but also retain its activity
     by_mint = {}
     for p in peers:
         base = p.get("baseToken") or {}
@@ -107,36 +156,69 @@ def detect_clone(current_mint: str, current_symbol: str, current_pair: dict):
         if not m:
             continue
         liq = (p.get("liquidity") or {}).get("usd") or 0
+        txns_h24 = (p.get("txns") or {}).get("h24") or {}
+        buys  = txns_h24.get("buys")  or 0
+        sells = txns_h24.get("sells") or 0
         if m not in by_mint or liq > by_mint[m]["liquidity"]:
             by_mint[m] = {
                 "mint":       m,
                 "liquidity":  liq,
                 "created_at": p.get("pairCreatedAt") or 0,
                 "volume_24h": (p.get("volume") or {}).get("h24") or 0,
+                "txns_24h":   buys + sells,
                 "fdv":        p.get("fdv") or 0,
                 "pair_url":   p.get("url"),
             }
     candidates = list(by_mint.values())
     if len(candidates) <= 1:
-        return {"is_original": True, "real_ca": current_mint, "reason": "only token with this symbol", "peers": []}
-    # Score each: higher liq + older = more likely real
+        return {"is_original": True, "real_ca": current_mint, "reason": "only token with this symbol", "peers": [], "dead_peer_count": 0}
+
+    # Liveness filter — dead peers can't be "the real one"
+    def is_alive(c):
+        # Always keep the current mint in the running so we can report on it
+        if c["mint"].lower() == current_mint.lower():
+            return True
+        return (c["volume_24h"] or 0) >= 500 or (c["txns_24h"] or 0) >= 20
+
+    alive = [c for c in candidates if is_alive(c)]
+    dead_peer_count = len(candidates) - len(alive)
+
+    # If after killing dead peers only the current mint remains, it's the only live one
+    if len(alive) <= 1:
+        return {
+            "is_original":      True,
+            "real_ca":          current_mint,
+            "peer_count":       len(candidates),
+            "alive_count":      len(alive),
+            "dead_peer_count":  dead_peer_count,
+            "reason":           f"only live '{current_symbol}' token ({dead_peer_count} dead peers ignored)",
+            "peers":            [],
+        }
+
+    # Score live candidates only: liquidity dominates, recent volume tie-breaks, age small bonus
     def score(c):
         return (c["liquidity"] or 0) + (c["volume_24h"] or 0) * 0.1 + (1e15 - (c["created_at"] or 1e15)) * 1e-9
-    candidates.sort(key=score, reverse=True)
-    top = candidates[0]
+
+    alive.sort(key=score, reverse=True)
+    top = alive[0]
     is_original = (top["mint"].lower() == current_mint.lower())
     return {
-        "is_original": is_original,
-        "real_ca":     top["mint"],
-        "real_liq":    top["liquidity"],
-        "real_url":    top["pair_url"],
-        "peer_count":  len(candidates),
-        "reason":      (
-            f"this CA ranks #1 of {len(candidates)} '{current_symbol}' tokens"
+        "is_original":      is_original,
+        "real_ca":          top["mint"],
+        "real_liq":         top["liquidity"],
+        "real_vol_24h":     top["volume_24h"],
+        "real_url":         top["pair_url"],
+        "peer_count":       len(candidates),
+        "alive_count":      len(alive),
+        "dead_peer_count":  dead_peer_count,
+        "reason":           (
+            f"this CA ranks #1 of {len(alive)} LIVE '{current_symbol}' tokens "
+            f"({dead_peer_count} dead peers ignored)"
             if is_original
-            else f"another '{current_symbol}' token has higher liquidity (${top['liquidity']:,.0f} vs current)"
+            else f"another '{current_symbol}' token is live with higher liquidity "
+                 f"(${top['liquidity']:,.0f}, ${top['volume_24h']:,.0f} 24h vol)"
         ),
-        "peers":       candidates[:5],
+        "peers":            alive[:5],
     }
 
 
@@ -275,12 +357,89 @@ def check_token(mint: str) -> dict:
         details["pair_address"]  = pair.get("pairAddress")
         details["symbol"]        = (pair.get("baseToken") or {}).get("symbol")
 
+        # --- FRESH MC COMPUTATION (multi-source) ---
+        # DEXScreener's reported MC can lag 5–15 min on fast launches. Compute it ourselves
+        # from on-chain supply (ground truth) × freshest price across DEXScreener + GeckoTerminal.
+        try:
+            supply = get_token_supply(mint)
+            dex_price = None
+            try:
+                dex_price = float(pair.get("priceUsd")) if pair.get("priceUsd") else None
+            except (TypeError, ValueError):
+                pass
+            gecko_price = get_geckoterminal_price(mint)
+
+            # Pick the highest of the live prices (fast-moving launches tend to have the
+            # stale source LAGGING below the real price). If they're within 5% just average.
+            prices = [p for p in (dex_price, gecko_price) if p and p > 0]
+            fresh_price = None
+            if prices:
+                if len(prices) == 1:
+                    fresh_price = prices[0]
+                else:
+                    spread = abs(prices[0] - prices[1]) / max(prices)
+                    fresh_price = sum(prices) / 2 if spread < 0.05 else max(prices)
+
+            details["dex_price"]   = dex_price
+            details["gecko_price"] = gecko_price
+            details["fresh_price"] = fresh_price
+            details["supply"]      = supply
+
+            if supply and fresh_price:
+                fresh_mc = supply * fresh_price
+                details["fresh_mc"] = fresh_mc
+                # If our computed MC differs meaningfully from DEXScreener's reported MC,
+                # flag it and override the displayed MC with the fresh one.
+                reported_mc = details.get("market_cap") or details.get("fdv")
+                if reported_mc and reported_mc > 0:
+                    gap = abs(fresh_mc - reported_mc) / reported_mc
+                    details["mc_gap_pct"] = round(gap * 100, 1)
+                    if gap > 0.20:
+                        reasons_yellow.append(
+                            f"MC source disagreement: DEXScreener ${reported_mc:,.0f} vs "
+                            f"computed ${fresh_mc:,.0f} (Δ{gap*100:.0f}%) — using fresh"
+                        )
+                # Override so downstream (liq:MC ratio, trade card, display) uses fresh MC
+                details["market_cap_reported"] = details.get("market_cap")
+                details["market_cap"] = fresh_mc
+                if details.get("fdv"):
+                    details["fdv_reported"] = details["fdv"]
+                    details["fdv"] = fresh_mc
+        except Exception as e:
+            log_msg = f"Fresh MC compute failed: {e.__class__.__name__}"
+            reasons_yellow.append(log_msg) if False else None  # silent on failure
+
         if liq_usd < 1000:
             reasons_red.append(f"Liquidity only ${liq_usd:,.0f} — exit will be impossible")
         elif liq_usd < 10000:
             reasons_yellow.append(f"Thin liquidity ${liq_usd:,.0f} — high slippage risk")
         else:
             reasons_green.append(f"Liquidity ${liq_usd:,.0f}")
+
+        # --- 2a. LIQUIDITY-TO-MARKET-CAP RATIO ---
+        # Big MC + tiny liq = paper wealth that can't be sold. Classic memecoin trap.
+        # Skip for trusted ecosystem tokens (SOL/USDC/etc — different math) and very small
+        # MC tokens (<$20k — absolute check above is what matters there).
+        mc_for_ratio = details.get("market_cap") or details.get("fdv")
+        if (
+            mc_for_ratio
+            and mc_for_ratio >= 20_000
+            and liq_usd > 0
+            and not is_trusted_ecosystem
+        ):
+            ratio = liq_usd / mc_for_ratio
+            ratio_pct = ratio * 100
+            details["liq_to_mc_pct"] = round(ratio_pct, 2)
+            if ratio < 0.01:
+                reasons_red.append(
+                    f"Liq only {ratio_pct:.1f}% of MC (${liq_usd:,.0f} vs ${mc_for_ratio:,.0f}) — exit will crash price"
+                )
+            elif ratio < 0.03:
+                reasons_yellow.append(
+                    f"Liq thin vs MC ({ratio_pct:.1f}%) — heavy slippage on exit"
+                )
+            elif ratio >= 0.05:
+                reasons_green.append(f"Healthy liq:MC ratio ({ratio_pct:.1f}%)")
 
         created_ms = pair.get("pairCreatedAt")
         if created_ms:
@@ -315,23 +474,34 @@ def check_token(mint: str) -> dict:
             try:
                 clone = detect_clone(mint, details.get("symbol"), pair)
                 details["clone_check"] = clone
+                sym = details.get("symbol")
+                dead = clone.get("dead_peer_count", 0)
                 if clone["is_original"] is False:
-                    real_liq = clone.get("real_liq", 0)
-                    this_liq = details.get("liquidity_usd") or 1
-                    gap = real_liq / this_liq if this_liq > 0 else 1
-                    sym = details.get("symbol")
-                    if gap >= 10:
+                    real_liq    = clone.get("real_liq", 0)
+                    real_vol    = clone.get("real_vol_24h", 0)
+                    this_liq    = details.get("liquidity_usd") or 1
+                    gap         = real_liq / this_liq if this_liq > 0 else 1
+                    # Only escalate to RED if the "real" peer is actually thriving
+                    # (real volume is the proof it's alive — stale liq isn't)
+                    if gap >= 10 and real_vol >= 5000:
                         reasons_red.append(
-                            f"CLONE: another '{sym}' has {gap:.0f}x more liquidity (${real_liq:,.0f}). "
-                            f"Real CA: {clone['real_ca']}"
+                            f"CLONE: live '{sym}' with {gap:.0f}x more liq (${real_liq:,.0f}, "
+                            f"${real_vol:,.0f} 24h vol). Real CA: {clone['real_ca']}"
                         )
                     else:
                         reasons_yellow.append(
-                            f"AMBIGUITY: another '{sym}' has more liq (${real_liq:,.0f}). "
-                            f"Verify which you want. Other CA: {clone['real_ca']}"
+                            f"AMBIGUITY: another '{sym}' shows higher liq (${real_liq:,.0f}, "
+                            f"${real_vol:,.0f} 24h vol). Verify which you want. Other CA: {clone['real_ca']}"
                         )
-                elif clone["is_original"] is True and clone.get("peer_count"):
-                    reasons_green.append(f"Original — #1 of {clone['peer_count']} '{details.get('symbol')}' tokens")
+                elif clone["is_original"] is True:
+                    if dead > 0:
+                        reasons_green.append(
+                            f"Original — only live '{sym}' token ({dead} dead peers ignored)"
+                        )
+                    elif clone.get("peer_count"):
+                        reasons_green.append(
+                            f"Original — #1 of {clone.get('alive_count', clone['peer_count'])} live '{sym}' tokens"
+                        )
             except Exception as e:
                 reasons_yellow.append(f"Clone check failed: {e.__class__.__name__}")
 
@@ -422,9 +592,9 @@ def check_token(mint: str) -> dict:
                     except Exception:
                         pass
                 details["top10_holders_pct"] = round(top10_pct, 1)
-                if top10_pct > 50:
+                if top10_pct > 70:
                     reasons_red.append(f"Top 10 holders own {top10_pct:.0f}% — dump risk")
-                elif top10_pct > 30:
+                elif top10_pct > 50:
                     reasons_yellow.append(f"Top 10 holders own {top10_pct:.0f}% — concentrated")
                 else:
                     reasons_green.append(f"Top 10 holders {top10_pct:.0f}% — distributed")
@@ -531,12 +701,17 @@ def format_report(result: dict) -> str:
 
     # Identity / clone check
     clone = d.get("clone_check") or {}
+    dead = clone.get("dead_peer_count", 0)
+    alive = clone.get("alive_count", clone.get("peer_count", 0))
     if clone.get("is_original") is True and clone.get("peer_count"):
-        lines.append(f"\n🆔 *Identity:* ✅ Original — #1 of {clone['peer_count']} same-symbol tokens")
+        if dead > 0 and alive <= 1:
+            lines.append(f"\n🆔 *Identity:* ✅ Only live '{d.get('symbol')}' ({dead} dead peers ignored)")
+        else:
+            lines.append(f"\n🆔 *Identity:* ✅ Original — #1 of {alive} live same-symbol tokens ({dead} dead ignored)")
     elif clone.get("is_original") is False:
         lines.append(f"\n🆔 *Identity:* ⚠️ *CLONE RISK*")
         lines.append(f"   Real CA: `{clone.get('real_ca')}`")
-        lines.append(f"   Real liq: ${clone.get('real_liq', 0):,.0f}")
+        lines.append(f"   Real liq: ${clone.get('real_liq', 0):,.0f}  |  24h vol: ${clone.get('real_vol_24h', 0):,.0f}")
 
     # Lifecycle
     if d.get("lifecycle_desc"):
@@ -575,6 +750,11 @@ def format_report(result: dict) -> str:
     mint = d.get("mint")
     if mint:
         lines.append(format_smart_wallet_section(mint, symbol=d.get("symbol")))
+
+    # Trade card — only for GREEN/YELLOW. RED never gets sizing.
+    tc = trade_card_for_check(result)
+    if tc:
+        lines.append(tc)
 
     lines.append("\n_Mechanical on-chain checks only. Does not predict price, dead launches, slow rugs, or your discipline._")
     return "\n".join(lines)

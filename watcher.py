@@ -21,14 +21,15 @@ import requests
 from collections import defaultdict
 from rug_check import check_token, format_report
 from smart_wallets import check_wallets_hold_token, load_wallets
+from trade_card import trade_card_for_check
 
 log = logging.getLogger(__name__)
 
 # ---------- CONFIG ----------
 PUMP_API        = "https://frontend-api.pump.fun/coins"
 TAVILY_API_KEY  = os.environ.get("TAVILY_API_KEY", "")
-SCAN_INTERVAL   = 300        # 5 minutes
-NARRATIVE_WINDOW = 1800      # 30 min — cluster detection window
+SCAN_INTERVAL   = 300        # 5 minutes — how often watcher wakes up
+NARRATIVE_WINDOW = 3600      # 1 hour — how far back to look for cluster
 MIN_CLUSTER     = 3          # 3+ tokens with same word = narrative forming
 TIMEOUT         = 10
 
@@ -100,18 +101,27 @@ def _find_narratives(coins: list) -> dict:
 # ---------- TWITTER CONFIRMATION ----------
 
 def _confirm_twitter(narrative: str) -> bool:
-    """Quick Tavily search to confirm narrative is trending on Twitter/crypto news."""
+    """Confirm narrative is actually trending on crypto-Twitter/Reddit.
+
+    Search uses the conventions real crypto posters use:
+      - $narrative (cashtag — price-action crowd)
+      - #narrative (hashtag — awareness crowd)
+    Restricted to the last 24h so stale posts don't count as buzz.
+    DEXScreener intentionally NOT in the domain list — it's a chart site,
+    not a discussion site; a listing isn't social proof.
+    """
     if not TAVILY_API_KEY:
         return True
     try:
         r = requests.post(
             "https://api.tavily.com/search",
             json={
-                "api_key": TAVILY_API_KEY,
-                "query": f"{narrative} solana memecoin crypto",
-                "search_depth": "basic",
-                "max_results": 3,
-                "include_domains": ["twitter.com", "x.com", "reddit.com", "dexscreener.com"],
+                "api_key":        TAVILY_API_KEY,
+                "query":          f'"${narrative}" OR "#{narrative}"',
+                "search_depth":   "basic",
+                "max_results":    3,
+                "days":           1,   # last 24 hours only
+                "include_domains": ["twitter.com", "x.com", "reddit.com"],
             },
             timeout=TIMEOUT,
         )
@@ -171,6 +181,8 @@ def _build_alert(narrative: str, token: dict, rug_result: dict, twitter_ok: bool
 
     twitter_line = "🐦 Twitter: ✅ Trending" if twitter_ok else "🐦 Twitter: ⚠️ Not confirmed yet"
 
+    trade_card_block = trade_card_for_check(rug_result)
+
     return (
         f"🚨 *{symbol}* — Narrative forming\n\n"
         f"📋 CA: `{mint}`\n"
@@ -183,6 +195,7 @@ def _build_alert(narrative: str, token: dict, rug_result: dict, twitter_ok: bool
         f"{twitter_line}\n\n"
         f"🛡 Rug check: {verdict_emoji} *{verdict}*\n"
         f"{wallet_line}"
+        f"{trade_card_block}"
     )
 
 
