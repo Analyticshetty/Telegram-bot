@@ -17,7 +17,7 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-WALLETS_FILE = os.environ.get("WALLETS_FILE", "smart_wallets.json")
+WALLETS_FILE = os.environ.get("WALLETS_FILE", "/data/smart_wallets.json")
 SOLANA_RPC   = "https://api.mainnet-beta.solana.com"
 CACHE_TTL    = 300   # seconds — 5 min
 TIMEOUT      = 8
@@ -28,12 +28,21 @@ _cache: dict = {}    # {mint: {"ts": float, "holders": list[dict]}}
 
 # ---------- JSON I/O ----------
 
+SEED_FILE = os.path.join(os.path.dirname(__file__), "smart_wallets.json")
+
 def _read_json() -> dict:
     try:
         with open(WALLETS_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"version": "2026-05-25", "wallets": []}
+        # First boot on persistent volume — seed from repo file
+        try:
+            with open(SEED_FILE, "r") as f:
+                data = json.load(f)
+            _write_json(data)
+            return data
+        except Exception:
+            return {"version": "2026-05-25", "wallets": []}
     except Exception:
         return {"version": "2026-05-25", "wallets": []}
 

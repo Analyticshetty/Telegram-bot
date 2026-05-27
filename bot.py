@@ -21,7 +21,8 @@ OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
 TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-DB_PATH = os.environ.get("DB_PATH", "bot_memory.db")
+os.makedirs("/data", exist_ok=True)
+DB_PATH = os.environ.get("DB_PATH", "/data/bot_memory.db")
 MAX_HISTORY = 30  # cap to avoid runaway context
 
 SYSTEM_PROMPT = (
