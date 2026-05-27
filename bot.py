@@ -90,12 +90,36 @@ def _set_state(key: str, value: str):
     except Exception as e:
         log.warning(f"Redis set_state failed: {e}")
 
+# ---------- LONG-TERM MEMORY ----------
+
+MEMORY_KEY = "shashi:memories"
+
+def load_memories() -> list:
+    try:
+        data = _redis.get(MEMORY_KEY)
+        return json.loads(data) if data else []
+    except Exception:
+        return []
+
+def save_memories(memories: list):
+    try:
+        _redis.set(MEMORY_KEY, json.dumps(memories))
+    except Exception as e:
+        log.warning(f"Redis save_memories failed: {e}")
+
+def memories_as_context() -> str:
+    memories = load_memories()
+    if not memories:
+        return ""
+    lines = "\n".join(f"- {m}" for m in memories)
+    return f"\n\nShashi's permanent rules & facts (always apply these):\n{lines}"
+
 def ensure_system_prompt(history):
+    full_prompt = SYSTEM_PROMPT + memories_as_context()
     if not history or history[0].get("role") != "system":
-        history = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        history = [{"role": "system", "content": full_prompt}] + history
     else:
-        # Refresh in case prompt evolved
-        history[0] = {"role": "system", "content": SYSTEM_PROMPT}
+        history[0] = {"role": "system", "content": full_prompt}
     return history
 
 
@@ -157,7 +181,10 @@ def handle_help(message):
         "🛡 Paste any Solana CA — auto rug-check.\n"
         "🛡 `/check <mint>` — explicit rug-check.\n"
         "🔍 `/scan` — Bitget-Latest-equivalent token scanner.\n"
-        "🧹 `/reset` — wipe conversation memory.\n\n"
+        "🧹 `/reset` — wipe conversation memory.\n"
+        "🧠 `/remember <fact>` — save a permanent rule or fact.\n"
+        "📋 `/memories` — show all permanent memories.\n"
+        "🗑 `/forget <fact>` — delete a memory.\n\n"
         "*Smart Wallet Tracker (owner only):*\n"
         "🐋 `/addwallet <addr> <label>` — track a wallet.\n"
         "📋 `/listwallets` — show all tracked wallets.\n"
@@ -363,6 +390,62 @@ def handle_watcher(message):
             f"`/watcher off` — stop",
             parse_mode="Markdown",
         )
+
+
+# ---------- MEMORY COMMANDS ----------
+
+@bot.message_handler(commands=['remember'])
+def handle_remember(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Usage: `/remember <fact>`\nExample: `/remember never buy RED tokens`", parse_mode="Markdown")
+        return
+    fact = parts[1].strip()
+    memories = load_memories()
+    if fact.lower() in [m.lower() for m in memories]:
+        bot.reply_to(message, "✅ Already remembered.")
+        return
+    memories.append(fact)
+    save_memories(memories)
+    bot.reply_to(message, f"🧠 Remembered: _{fact}_\nTotal memories: {len(memories)}", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['memories'])
+def handle_memories(message):
+    if not owner_only(message):
+        return
+    memories = load_memories()
+    if not memories:
+        bot.reply_to(message, "🧠 No memories saved yet.\nUse `/remember <fact>` to add one.", parse_mode="Markdown")
+        return
+    lines = [f"🧠 *Permanent memories ({len(memories)}):*\n"]
+    for i, m in enumerate(memories, 1):
+        lines.append(f"{i}. {m}")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['forget'])
+def handle_forget(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Usage: `/forget <fact>`\nOr `/forget all` to wipe everything.", parse_mode="Markdown")
+        return
+    arg = parts[1].strip()
+    if arg.lower() == "all":
+        save_memories([])
+        bot.reply_to(message, "🧠 All memories wiped.")
+        return
+    memories = load_memories()
+    new = [m for m in memories if m.lower() != arg.lower()]
+    if len(new) == len(memories):
+        bot.reply_to(message, "⚠️ Memory not found. Use `/memories` to see exact text.", parse_mode="Markdown")
+        return
+    save_memories(new)
+    bot.reply_to(message, f"✅ Forgotten. Memories remaining: {len(new)}", parse_mode="Markdown")
 
 
 # ---------- CAPITAL COMMAND ----------
