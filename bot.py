@@ -1,6 +1,6 @@
 import telebot
 from groq import Groq
-import sqlite3
+import redis
 import json
 import os
 import base64
@@ -21,8 +21,13 @@ OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
 TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-os.makedirs("/data", exist_ok=True)
-DB_PATH = os.environ.get("DB_PATH", "/data/bot_memory.db")
+
+# Redis — persistent memory across redeploys
+_redis = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    decode_responses=True,
+    ssl_cert_reqs=None,
+)
 MAX_HISTORY = 30  # cap to avoid runaway context
 
 SYSTEM_PROMPT = (
@@ -54,49 +59,36 @@ MAX_TOOL_ITERATIONS = 4
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
 
-# ---------- DATABASE SETUP ----------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
-            user_id INTEGER PRIMARY KEY,
-            history TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# ---------- REDIS STORAGE ----------
 
 def load_history(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT history FROM conversations WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
-    return []
+    try:
+        data = _redis.get(f"history:{user_id}")
+        return json.loads(data) if data else []
+    except Exception:
+        return []
 
 def save_history(user_id, history):
-    # Trim non-system messages to last MAX_HISTORY
     sys_msgs = [m for m in history if m["role"] == "system"]
     other    = [m for m in history if m["role"] != "system"][-MAX_HISTORY:]
     history  = sys_msgs + other
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO conversations (user_id, history)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET history = excluded.history
-    ''', (user_id, json.dumps(history)))
-    conn.commit()
-    conn.close()
+    try:
+        _redis.set(f"history:{user_id}", json.dumps(history))
+    except Exception as e:
+        log.warning(f"Redis save_history failed: {e}")
+
+def _get_state(key: str, default: str = "") -> str:
+    try:
+        val = _redis.get(f"state:{key}")
+        return val if val is not None else default
+    except Exception:
+        return default
+
+def _set_state(key: str, value: str):
+    try:
+        _redis.set(f"state:{key}", value)
+    except Exception as e:
+        log.warning(f"Redis set_state failed: {e}")
 
 def ensure_system_prompt(history):
     if not history or history[0].get("role") != "system":
@@ -380,22 +372,12 @@ def handle_capital(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        # Show current
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("SELECT value FROM bot_state WHERE key='capital_usd'").fetchone()
-        conn.close()
-        cap = row[0] if row else "25"
+        cap = _get_state("capital_usd", "25")
         bot.reply_to(message, f"💰 Current capital: *${cap}*\nTo update: `/capital 50`", parse_mode="Markdown")
         return
     try:
         amount = float(parts[1].strip().replace("$", ""))
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO bot_state(key,value) VALUES('capital_usd',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(amount),)
-        )
-        conn.commit()
-        conn.close()
+        _set_state("capital_usd", str(amount))
         entry = round(amount * 0.15, 2)
         bot.reply_to(message, f"✅ Capital updated to *${amount:.2f}*\n15% entry size = *${entry:.2f}*", parse_mode="Markdown")
     except ValueError:
@@ -534,6 +516,5 @@ def handle_image(message):
     bot.reply_to(message, reply)
 
 # ---------- START ----------
-init_db()
-print("Bot is running with persistent memory and image support...")
+print("Bot is running with persistent memory (Redis) and image support...")
 bot.polling(none_stop=True, interval=0)
