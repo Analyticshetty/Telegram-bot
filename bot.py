@@ -352,12 +352,21 @@ def handle_watcher(message):
         watcher_module.stop()
         bot.reply_to(message, "🔕 Watcher stopped.")
     else:
-        status = "✅ Running" if watcher_module.is_running() else "⛔ Stopped"
+        s = watcher_module.get_status()
+        status = "✅ Running" if s["running"] else "⛔ Stopped"
+        if s["scan_count"] == 0:
+            scan_line = "⏳ First scan not done yet"
+        else:
+            scan_line = (
+                f"🔄 Scans done: {s['scan_count']}\n"
+                f"⏱ Last scan: {s['mins_ago']} min ago\n"
+                f"🚨 Last scan alerts: {s['last_found']}"
+            )
         bot.reply_to(
             message,
             f"👁 *Watcher status:* {status}\n\n"
-            f"Commands:\n"
-            f"`/watcher on` — start scanning\n"
+            f"{scan_line}\n\n"
+            f"`/watcher on` — start\n"
             f"`/watcher off` — stop",
             parse_mode="Markdown",
         )

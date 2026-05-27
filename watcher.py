@@ -46,6 +46,9 @@ _thread         = None
 _seen_narratives = set()   # don't re-alert same narrative
 _seen_tokens    = set()    # don't re-alert same token CA
 _lock           = threading.Lock()
+_last_scan_time = None
+_last_scan_found = 0       # narratives found in last scan
+_scan_count     = 0        # total scans done
 
 
 # ---------- PUMP.FUN ----------
@@ -185,16 +188,17 @@ def _build_alert(narrative: str, token: dict, rug_result: dict, twitter_ok: bool
 
 # ---------- SCAN LOOP ----------
 
-def _scan_once(send_alert_fn):
-    """One full scan cycle. Calls send_alert_fn(text) for each valid alert."""
+def _scan_once(send_alert_fn) -> int:
+    """One full scan cycle. Returns number of alerts sent."""
+    alerts_sent = 0
     coins = _fetch_new_pumps(limit=200)
     if not coins:
         log.warning("Watcher: pump.fun returned 0 coins")
-        return
+        return 0
 
     narratives = _find_narratives(coins)
     if not narratives:
-        return
+        return 0
 
     for narrative, cluster_coins in narratives.items():
         with _lock:
@@ -230,6 +234,7 @@ def _scan_once(send_alert_fn):
         # Build and send alert
         alert = _build_alert(narrative, token, rug_result, twitter_ok)
         send_alert_fn(alert)
+        alerts_sent += 1
 
         with _lock:
             _seen_narratives.add(narrative)
@@ -237,13 +242,18 @@ def _scan_once(send_alert_fn):
 
         time.sleep(2)  # brief pause between alerts
 
+    return alerts_sent
+
 
 def _loop(send_alert_fn):
-    global _running
+    global _running, _last_scan_time, _last_scan_found, _scan_count
     log.info("Watcher started.")
     while _running:
         try:
-            _scan_once(send_alert_fn)
+            _last_scan_found = _scan_once(send_alert_fn)
+            _last_scan_time  = time.time()
+            _scan_count     += 1
+            log.info(f"Watcher scan #{_scan_count} done — {_last_scan_found} narratives found")
         except Exception as e:
             log.warning(f"Watcher scan error: {e}")
         for _ in range(SCAN_INTERVAL):
@@ -273,3 +283,15 @@ def stop():
 
 def is_running() -> bool:
     return _running
+
+
+def get_status() -> dict:
+    mins_ago = None
+    if _last_scan_time:
+        mins_ago = round((time.time() - _last_scan_time) / 60, 1)
+    return {
+        "running":     _running,
+        "scan_count":  _scan_count,
+        "mins_ago":    mins_ago,
+        "last_found":  _last_scan_found,
+    }
