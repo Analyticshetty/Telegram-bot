@@ -296,18 +296,37 @@ def handle_listwallets(message):
     active = [w for w in all_w if not str(w.get("address", "")).startswith("TODO")]
     todo   = [w for w in all_w if str(w.get("address", "")).startswith("TODO")]
 
-    lines = [f"*Smart Wallet List* ({len(active)} active, {len(todo)} pending)\n"]
+    # Parse optional page arg: /listwallets [page]
+    parts = (message.text or "").split()
+    page = 1
+    if len(parts) > 1:
+        try:
+            page = max(1, int(parts[1]))
+        except ValueError:
+            page = 1
+
+    PAGE_SIZE = 50
+    total_pages = max(1, (len(active) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start = (page - 1) * PAGE_SIZE
+    end   = start + PAGE_SIZE
+
+    header = f"*Smart Wallet List* ({len(active)} active, {len(todo)} pending)"
+    if total_pages > 1:
+        header += f"\n_Page {page}/{total_pages} — `/listwallets {page+1}` for next_"
+
+    lines = [header, ""]
     if active:
-        for w in active:
+        for w in active[start:end]:
             addr = w.get("address", "")
             lines.append(f"• `{addr[:8]}...{addr[-4:]}` — {w.get('label','?')} _(src: {w.get('source','?')})_")
     else:
         lines.append("_(No active wallets yet — add via /addwallet)_")
 
-    if todo:
+    if todo and page == total_pages:
         lines.append(f"\n_{len(todo)} TODO placeholder(s) — replace in smart\\_wallets.json_")
 
-    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 
 # ---------- WALLET DISCOVERY ----------
