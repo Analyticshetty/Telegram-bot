@@ -18,6 +18,9 @@ import memory_store
 import position_tracker
 import sleep_mode
 import loss_tracker
+import trade_import
+import stats as stats_module
+from telebot import types as tg_types
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
@@ -220,6 +223,9 @@ def handle_help(message):
         "*Sleep + Loss tracking:*\n"
         "😴 `/sleep on/off/status` — silence watcher alerts (TP/SL still fire)\n"
         "📊 `/losses` — log of all losing trades + Fib/volume analysis\n\n"
+        "*Trade import + Stats:*\n"
+        "📸 Send Bitget screenshot with caption \"buy\"/\"sell\"/\"trade\" — auto-parse + open/close position\n"
+        "📈 `/stats [positions|watcher|narratives]` — outcome aggregates + win rate\n\n"
         "*Memory (persists across redeploys):*\n"
         "🚨 `/alerts [keyword]` — last 20 watcher alerts (or search by word)\n"
         "📋 `/history` — your last 20 /check results\n"
@@ -919,41 +925,176 @@ def chat_with_tools(messages):
             })
     return "I tried searching but ran out of steps. Try rephrasing the question."
 
+# ---------- STATS COMMAND ----------
+
+@bot.message_handler(commands=['stats'])
+def handle_stats(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "overall"
+
+    if sub.startswith("pos"):
+        text = stats_module.format_positions_detail()
+    elif sub.startswith("watch"):
+        text = stats_module.format_watcher_detail()
+    elif sub.startswith("narr"):
+        text = stats_module.format_narratives()
+    else:
+        text = stats_module.format_overall(message.chat.id)
+
+    bot.reply_to(message, text, parse_mode="Markdown", disable_web_page_preview=True)
+
+
 # ---------- IMAGE HANDLER ----------
+
+TRADE_KEYWORDS = {"trade", "buy", "sell", "bitget", "order", "import", "filled", "position"}
+
+
+def _looks_like_trade_request(caption: str) -> bool:
+    if not caption:
+        return False
+    words = {w.strip(".,!?:;").lower() for w in caption.split()}
+    return bool(words & TRADE_KEYWORDS)
+
+
 @bot.message_handler(content_types=['photo'])
 def handle_image(message):
     user_id = message.chat.id
-    caption = message.caption or "What is in this image? Describe it in detail."
+    caption = message.caption or ""
 
-    # Download image from Telegram
+    # Download image once — we may use it twice
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded = bot.download_file(file_info.file_path)
     image_b64 = base64.b64encode(downloaded).decode("utf-8")
 
-    # Send to vision model
+    # If caption suggests a trade screenshot, attempt structured extraction
+    if is_owner(message) and _looks_like_trade_request(caption):
+        bot.reply_to(message, "🔎 Parsing trade screenshot…")
+        parsed = trade_import.extract_trade_from_image(client, image_b64, VISION_MODEL)
+
+        if parsed.get("error"):
+            bot.send_message(user_id, f"⚠️ Couldn't parse as trade: {parsed['error']}\nFalling back to image description.")
+            # fall through to normal vision below
+        else:
+            # Resolve symbol → candidate CAs
+            candidates = trade_import.find_candidate_cas(parsed.get("symbol"), memory_store)
+            text = trade_import.format_confirmation(parsed, candidates)
+
+            # Build inline keyboard
+            kb = tg_types.InlineKeyboardMarkup(row_width=3)
+            if candidates:
+                btns = []
+                for i, c in enumerate(candidates, 1):
+                    btns.append(tg_types.InlineKeyboardButton(
+                        f"✅ {i}",
+                        callback_data=f"imp:confirm:{i-1}",
+                    ))
+                kb.add(*btns)
+            kb.add(tg_types.InlineKeyboardButton("❌ Cancel", callback_data="imp:cancel"))
+
+            sent = bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+
+            # Stash payload for the callback handler
+            trade_import.save_pending(user_id, sent.message_id, {
+                "parsed":     parsed,
+                "candidates": candidates,
+            })
+            return  # done — confirmation flow handles the rest
+
+    # Default behavior: describe the image
+    describe_caption = caption or "What is in this image? Describe it in detail."
     response = client.chat.completions.create(
         model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_b64}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": caption
-                    }
-                ]
-            }
-        ],
-        max_tokens=1024
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": describe_caption},
+            ],
+        }],
+        max_tokens=1024,
     )
     reply = response.choices[0].message.content
     bot.reply_to(message, reply)
+
+
+# ---------- CALLBACK HANDLER (inline button taps) ----------
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("imp:"))
+def handle_import_callback(call):
+    user_id = call.message.chat.id
+    msg_id  = call.message.message_id
+    parts = call.data.split(":")
+
+    if parts[1] == "cancel":
+        trade_import.delete_pending(user_id, msg_id)
+        bot.edit_message_text("❌ Import cancelled.", user_id, msg_id)
+        bot.answer_callback_query(call.id)
+        return
+
+    if parts[1] == "confirm":
+        try:
+            idx = int(parts[2])
+        except (IndexError, ValueError):
+            bot.answer_callback_query(call.id, "Bad selection.")
+            return
+
+        pending = trade_import.load_pending(user_id, msg_id)
+        if not pending:
+            bot.edit_message_text("⚠️ This import expired. Send the screenshot again.", user_id, msg_id)
+            bot.answer_callback_query(call.id)
+            return
+
+        candidates = pending.get("candidates") or []
+        parsed = pending.get("parsed") or {}
+        if idx >= len(candidates):
+            bot.answer_callback_query(call.id, "Invalid candidate.")
+            return
+
+        chosen = candidates[idx]
+        mint   = chosen["mint"]
+        action = (parsed.get("action") or "").lower()
+        price  = parsed.get("price")
+        size   = parsed.get("size_usd")
+
+        if action == "buy":
+            if not size or size <= 0:
+                bot.edit_message_text("❌ Missing size. Cannot open position.", user_id, msg_id)
+                bot.answer_callback_query(call.id)
+                return
+            result = position_tracker.open_position(mint, float(size), float(price) if price else None)
+            if not result.get("ok"):
+                bot.edit_message_text(f"❌ {result.get('error')}", user_id, msg_id)
+            else:
+                p = result["position"]
+                bot.edit_message_text(
+                    f"✅ *Imported BUY — {p['symbol']}*\n\n"
+                    + position_tracker.format_position(p, live_price=p["entry_price"])
+                    + "\n\n_Tracker watching TP1/TP2/SL every 60s._",
+                    user_id, msg_id, parse_mode="Markdown", disable_web_page_preview=True,
+                )
+        elif action == "sell":
+            result = position_tracker.close_position(mint, reason="manual_import",
+                                                     exit_price=float(price) if price else None)
+            if not result.get("ok"):
+                bot.edit_message_text(f"❌ {result.get('error')}", user_id, msg_id)
+            else:
+                p = result["position"]
+                pnl = p.get("pnl_usd", 0)
+                pct = p.get("pnl_pct", 0)
+                icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+                bot.edit_message_text(
+                    f"{icon} *Imported SELL — {p['symbol']}*\n"
+                    f"Exit: ${p.get('exit_price', 0):.10f}\n"
+                    f"P&L: ${pnl:+.2f} ({pct:+.1f}%)",
+                    user_id, msg_id, parse_mode="Markdown",
+                )
+        else:
+            bot.edit_message_text(f"⚠️ Unknown action: {action}", user_id, msg_id)
+
+        trade_import.delete_pending(user_id, msg_id)
+        bot.answer_callback_query(call.id, "Done")
 
 # ---------- START ----------
 print("Bot is running with persistent memory (Redis) and image support...")
