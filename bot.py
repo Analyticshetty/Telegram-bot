@@ -904,7 +904,7 @@ def handle_reset(message):
 
 
 # ---------- TEXT HANDLER ----------
-@bot.message_handler(func=lambda message: True)
+@bot.message_handler(func=lambda message: not (message.text or "").startswith("/"))
 def handle_message(message):
     user_id = message.chat.id
     user_text = (message.text or "").strip()
