@@ -84,6 +84,24 @@ def get_live_price(mint: str):
     return None
 
 
+def get_price_and_mc(mint: str):
+    """Return (price_usd, market_cap_usd) from the top-liquidity DEXScreener pair.
+    market_cap falls back to fdv. Either value may be None if unavailable."""
+    try:
+        r = requests.get(DEXSCREENER_URL.format(mint=mint), timeout=TIMEOUT)
+        if r.status_code == 200:
+            pairs = (r.json() or {}).get("pairs") or []
+            if pairs:
+                pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+                top = pairs[0]
+                px = top.get("priceUsd")
+                mc = top.get("marketCap") or top.get("fdv")
+                return (float(px) if px else None, float(mc) if mc else None)
+    except Exception:
+        pass
+    return (None, None)
+
+
 def get_token_symbol(mint: str):
     """Best-effort symbol lookup."""
     try:

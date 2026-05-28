@@ -162,24 +162,30 @@ def find_candidate_cas(symbol: str, memory_store_module=None) -> list:
     return candidates[:5]  # cap at top 5
 
 
-def reconstruct_holding(parsed: dict, live_price: float) -> dict:
-    """For a 'holding' screen, derive entry price + USD size from the market-cap
-    ratio and live price. No FX needed: entry/current price scales with market cap
-    (same supply), so entry_price = live_price * (entry_mc / latest_mc).
+def reconstruct_holding(parsed: dict, live_price: float, live_mc: float) -> dict:
+    """For a 'holding' screen, derive entry price + USD size from the token's
+    supply and the entry market cap off the screenshot. No FX needed and
+    time-independent (unlike a live-price * mc-ratio approach, which breaks if
+    the price moves between screenshot and import):
+
+        supply      = live_mc / live_price       (current circulating supply)
+        entry_price = entry_mc / supply
+        size_usd    = tokens_held * entry_price
+
     Returns {'price', 'size_usd'} or {'error': ...}."""
     try:
         tokens = float(parsed.get("tokens_held") or 0)
         entry_mc = float(parsed.get("entry_mc_usd") or 0)
-        latest_mc = float(parsed.get("latest_mc_usd") or 0)
     except (TypeError, ValueError):
         return {"error": "Could not read numbers off the holding screen"}
     if tokens <= 0:
         return {"error": "No token amount found on screen"}
-    if entry_mc <= 0 or latest_mc <= 0:
-        return {"error": "Missing market-cap values — can't derive entry"}
-    if not live_price or live_price <= 0:
-        return {"error": "Could not fetch live price for this CA"}
-    entry_price = live_price * (entry_mc / latest_mc)
+    if entry_mc <= 0:
+        return {"error": "Missing 'Market cap (buy price)' — can't derive entry"}
+    if not live_price or live_price <= 0 or not live_mc or live_mc <= 0:
+        return {"error": "Could not fetch live price/market cap for this CA"}
+    supply = live_mc / live_price
+    entry_price = entry_mc / supply
     size_usd = tokens * entry_price
     return {"price": entry_price, "size_usd": size_usd}
 

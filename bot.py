@@ -1507,11 +1507,11 @@ def handle_import_callback(call):
         size   = parsed.get("size_usd")
 
         # Holding-screen imports carry no fill price/size — derive them now from
-        # the chosen CA's live price and the market-cap ratio off the screenshot.
+        # the chosen CA's supply (live mc / live price) and the screenshot's entry mc.
         live = None
         if parsed.get("screen_type") == "holding":
-            live = position_tracker.get_live_price(mint)
-            derived = trade_import.reconstruct_holding(parsed, live)
+            live, live_mc = position_tracker.get_price_and_mc(mint)
+            derived = trade_import.reconstruct_holding(parsed, live, live_mc)
             if derived.get("error"):
                 bot.edit_message_text(f"❌ {derived['error']}", user_id, msg_id)
                 bot.answer_callback_query(call.id)
