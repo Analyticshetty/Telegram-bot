@@ -1508,6 +1508,7 @@ def handle_import_callback(call):
 
         # Holding-screen imports carry no fill price/size — derive them now from
         # the chosen CA's live price and the market-cap ratio off the screenshot.
+        live = None
         if parsed.get("screen_type") == "holding":
             live = position_tracker.get_live_price(mint)
             derived = trade_import.reconstruct_holding(parsed, live)
@@ -1529,9 +1530,12 @@ def handle_import_callback(call):
                 bot.edit_message_text(f"❌ {result.get('error')}", user_id, msg_id)
             else:
                 p = result["position"]
+                # Imports are existing bags — show the REAL live price + P&L, not
+                # entry (which would falsely read +0.0% on a position already in loss).
+                disp_live = live if live else position_tracker.get_live_price(mint)
                 bot.edit_message_text(
                     f"✅ *Imported BUY — {p['symbol']}*\n\n"
-                    + position_tracker.format_position(p, live_price=p["entry_price"])
+                    + position_tracker.format_position(p, live_price=disp_live or p["entry_price"])
                     + "\n\n_Tracker watching TP1/TP2/SL every 60s._",
                     user_id, msg_id, parse_mode="Markdown", disable_web_page_preview=True,
                 )
