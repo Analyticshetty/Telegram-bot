@@ -1617,4 +1617,4 @@ threading.Thread(target=_healthcheck_loop, daemon=True).start()
 threading.Thread(target=_daily_summary_loop, daemon=True).start()
 print("Daily summary thread started (fires at 9am IST).")
 
-bot.polling(none_stop=True, interval=0)
+bot.infinity_polling(timeout=20, long_polling_timeout=15)
