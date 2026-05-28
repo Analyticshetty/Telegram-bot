@@ -6,6 +6,7 @@ import os
 import base64
 import threading
 import logging
+import time
 
 log = logging.getLogger(__name__)
 from rug_check import check_token, format_report, is_valid_solana_mint
