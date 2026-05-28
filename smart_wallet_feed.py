@@ -38,7 +38,9 @@ WINDOW_SECONDS    = 600          # 10 min convergence window
 MIN_CONVERGENCE   = 2            # 2 wallets = signal
 FRESH_AGE_MAX_MIN = 360          # only alert on tokens < 6h old
 ALERT_DEDUPE_TTL  = 86400        # 24h
-BUYS_TTL          = 7200         # 2h memory of recent buys per CA
+BUYS_TTL          = 7200         # 2h memory of recent buys per CA (convergence window)
+ACCUM_HOLDERS_TTL = 30 * 86400   # 30 days — remember all wallet holders per CA
+ACCUM_ENTRY_TTL   = 7 * 86400    # 7 days — dedup per (mint+wallet) entry
 TIMEOUT           = 8
 
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
@@ -161,6 +163,145 @@ def _mark_alerted(mint: str):
         _redis.set(f"sw_feed:alerted:{mint}", "1", ex=ALERT_DEDUPE_TTL)
     except Exception:
         pass
+
+
+# ---------- ACCUMULATION TRACKING (no time window, no age gate) ----------
+
+def _record_accumulation(mint: str, wallet_addr: str, wallet_label: str, ts: int):
+    """Track every wallet that has ever bought this token.
+    Returns (prior_holders, is_new_entry).
+    prior_holders = wallets that were already in before this one.
+    is_new_entry  = True if this wallet hadn't been recorded yet."""
+    holders_key = f"sw_accum:holders:{mint}"
+    dedup_key   = f"sw_accum:entry:{mint}:{wallet_addr}"
+
+    # Already processed this wallet+token combo recently?
+    try:
+        if _redis.get(dedup_key):
+            return [], False
+    except Exception:
+        pass
+
+    # Load existing holders
+    try:
+        raw     = _redis.get(holders_key)
+        holders = json.loads(raw) if raw else []
+    except Exception:
+        holders = []
+
+    prior = [h for h in holders if h.get("wallet") != wallet_addr]
+
+    # Add this wallet to holders list
+    if not any(h.get("wallet") == wallet_addr for h in holders):
+        holders.append({"wallet": wallet_addr, "label": wallet_label, "ts": ts})
+        try:
+            _redis.set(holders_key, json.dumps(holders), ex=ACCUM_HOLDERS_TTL)
+        except Exception:
+            pass
+
+    # Mark as processed — won't re-fire for this wallet+token for 7 days
+    try:
+        _redis.set(dedup_key, "1", ex=ACCUM_ENTRY_TTL)
+    except Exception:
+        pass
+
+    return prior, len(prior) >= 1
+
+
+def _build_accum_alert(mint: str, prior_holders: list, new_buyer: dict,
+                       age_min, rug_result) -> str:
+    """Format the accumulation alert — distinct from convergence."""
+    new_label = new_buyer.get("label") or "?"
+    prior_labels = ", ".join(h.get("label", "?") for h in prior_holders[:5])
+
+    age_str = "unknown"
+    if age_min is not None:
+        age_str = f"{age_min:.0f}min" if age_min < 60 else f"{age_min/60:.1f}h"
+
+    verdict_icon = "⚪"
+    extras = ""
+    if rug_result:
+        verdict = rug_result.get("verdict") or "UNCHECKED"
+        verdict_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(verdict, "⚪")
+        d   = rug_result.get("details") or {}
+        mc  = d.get("market_cap") or 0
+        liq = d.get("liquidity_usd") or 0
+        sym = d.get("symbol") or "?"
+        extras = (
+            f"\n📊 Symbol: *{sym}*\n"
+            f"💰 MC: ${mc:,.0f}  |  💧 Liq: ${liq:,.0f}"
+        )
+
+    # How long ago did the first holder buy?
+    oldest_ts = min((h.get("ts") or 0) for h in prior_holders) if prior_holders else 0
+    if oldest_ts:
+        first_ago = (time.time() - oldest_ts) / 3600
+        first_str = f"{first_ago:.1f}h ago" if first_ago >= 1 else f"{int(first_ago*60)}min ago"
+    else:
+        first_str = "unknown"
+
+    return (
+        f"🐋 *SMART WALLET ACCUMULATION*\n\n"
+        f"📋 CA: `{mint}`\n"
+        f"⏱ Token age: {age_str}\n\n"
+        f"🔵 *{new_label}* just bought\n"
+        f"Already held by: *{prior_labels}*\n"
+        f"   (first wallet in: {first_str})\n"
+        f"Total smart wallets: {len(prior_holders) + 1}{extras}\n"
+        f"🛡 Rug check: {verdict_icon}\n\n"
+        f"_Independent accumulation — not coordinated buying. "
+        f"Multiple smart wallets reached the same conclusion at different times._"
+    )
+
+
+def _trigger_accumulation_alert(mint: str, prior_holders: list, new_buyer: dict):
+    """Rug check + send accumulation alert. Skips RED."""
+    # Don't fire if convergence already sent an alert on this mint recently
+    if _has_been_alerted(mint):
+        log.info(f"sw_feed accum skipped {mint} — convergence already alerted")
+        return
+
+    age_min    = _token_age_minutes(mint)
+    rug_result = None
+    try:
+        from rug_check import check_token
+        rug_result = check_token(mint)
+        if rug_result.get("verdict") == "RED":
+            log.info(f"sw_feed accum on {mint} but RED — suppressed")
+            _mark_alerted(mint)
+            return
+    except Exception as e:
+        log.warning(f"sw_feed accum rug_check failed for {mint}: {e}")
+
+    alert = _build_accum_alert(mint, prior_holders, new_buyer, age_min, rug_result)
+    if _alert_fn:
+        try:
+            _alert_fn(alert)
+        except Exception as e:
+            log.warning(f"sw_feed accum alert send failed: {e}")
+
+    _mark_alerted(mint)
+
+    try:
+        import memory_store
+        d = (rug_result or {}).get("details") or {}
+        memory_store.save_alert(
+            narrative="smart_wallet_accumulation",
+            mint=mint,
+            symbol=d.get("symbol"),
+            verdict=(rug_result or {}).get("verdict") or "UNCHECKED",
+            mc=d.get("market_cap"),
+            liq=d.get("liquidity_usd"),
+            twitter_ok=None,
+            smart_wallets=len(prior_holders) + 1,
+            cluster_size=len(prior_holders) + 1,
+            full_text=alert,
+        )
+    except Exception as e:
+        log.warning(f"sw_feed accum memory_store save failed: {e}")
+
+    global _last_cycle_alerts
+    _last_cycle_alerts += 1
 
 
 def _get_cursor(wallet: str) -> dict:
@@ -292,9 +433,14 @@ def _scan_wallet(wallet: dict) -> int:
         updated_buys = _record_buy(mint, addr, label, ts)
         recorded += 1
 
-        # Convergence check
+        # Convergence check (same 10-min window, fresh token only)
         if len(updated_buys) >= MIN_CONVERGENCE and not _has_been_alerted(mint):
             _trigger_convergence_alert(mint, updated_buys)
+
+        # Accumulation check (no time window, no age gate — any 2+ wallets ever)
+        prior, is_accum = _record_accumulation(mint, addr, label, ts)
+        if is_accum:
+            _trigger_accumulation_alert(mint, prior, {"wallet": addr, "label": label, "ts": ts})
 
     # Update cursor to newest sig
     _save_cursor(addr, sigs[0].get("signature"))
