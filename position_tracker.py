@@ -28,6 +28,7 @@ import logging
 import threading
 import requests
 import redis
+import loss_tracker
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +204,15 @@ def close_position(mint: str, reason: str = "manual", exit_price: float = None) 
         target["pnl_usd"] = round(pnl, 2)
         target["pnl_pct"] = round((pnl / size) * 100, 1) if size else 0
         _push_closed(target)
+
+    # Loss tracker — evaluate every closed position with negative P&L
+    # Pure data collection, no actions taken (per design)
+    try:
+        if target.get("pnl_usd", 0) < 0:
+            evaluation = loss_tracker.evaluate(target, exit_price)
+            loss_tracker.log_loss(target, exit_price, evaluation)
+    except Exception as e:
+        log.warning(f"loss_tracker evaluation failed: {e}")
 
     return {"ok": True, "position": target}
 

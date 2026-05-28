@@ -16,6 +16,8 @@ from wallet_discovery import discover_wallets
 import watcher as watcher_module
 import memory_store
 import position_tracker
+import sleep_mode
+import loss_tracker
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
@@ -215,6 +217,9 @@ def handle_help(message):
         "📤 `/sell <CA>` — manually close\n"
         "📂 `/positions` — list open positions\n"
         "📁 `/closed` — last 20 closed\n\n"
+        "*Sleep + Loss tracking:*\n"
+        "😴 `/sleep on/off/status` — silence watcher alerts (TP/SL still fire)\n"
+        "📊 `/losses` — log of all losing trades + Fib/volume analysis\n\n"
         "*Memory (persists across redeploys):*\n"
         "🚨 `/alerts [keyword]` — last 20 watcher alerts (or search by word)\n"
         "📋 `/history` — your last 20 /check results\n"
@@ -364,8 +369,12 @@ def handle_discover(message):
 # ---------- WATCHER COMMANDS ----------
 
 def _watcher_alert(text: str):
-    """Send alert to owner."""
+    """Send alert to owner — or queue it if sleep mode is on."""
     if not OWNER_TELEGRAM_ID:
+        return
+    # Sleep mode: queue watcher alerts only (position TP/SL still fire)
+    if sleep_mode.queue_alert(text):
+        log.info("Watcher alert queued (sleep mode on)")
         return
     try:
         bot.send_message(
@@ -603,6 +612,89 @@ def handle_closed(message):
     positions = position_tracker.list_closed(limit=20)
     bot.reply_to(message, position_tracker.format_closed_list(positions),
                  parse_mode="Markdown", disable_web_page_preview=True)
+
+
+# ---------- SLEEP MODE COMMANDS ----------
+
+@bot.message_handler(commands=['sleep'])
+def handle_sleep(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    action = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if action == "on":
+        if sleep_mode.is_sleeping():
+            bot.reply_to(message, "😴 Already sleeping.")
+            return
+        result = sleep_mode.turn_on()
+        if result.get("ok"):
+            bot.reply_to(
+                message,
+                "😴 *Sleep mode ON*\n\n"
+                "Watcher narrative alerts will be queued silently.\n"
+                "Position TP/SL/chat still fire normally.\n\n"
+                "Wake with `/sleep off` for the summary.",
+                parse_mode="Markdown",
+            )
+        else:
+            bot.reply_to(message, f"⚠️ Failed: {result.get('error')}")
+
+    elif action == "off":
+        if not sleep_mode.is_sleeping():
+            bot.reply_to(message, "☀️ Wasn't sleeping.")
+            return
+        result = sleep_mode.turn_off()
+        if result.get("ok"):
+            summary = sleep_mode.format_wake_summary(
+                result.get("queue", []),
+                result.get("duration_mins"),
+            )
+            bot.reply_to(message, summary, parse_mode="Markdown", disable_web_page_preview=True)
+        else:
+            bot.reply_to(message, f"⚠️ Failed: {result.get('error')}")
+
+    else:
+        s = sleep_mode.status()
+        if s["sleeping"]:
+            mins = s.get("mins_asleep", 0)
+            bot.reply_to(
+                message,
+                f"😴 *Sleep mode: ON*\n\n"
+                f"⏱ Asleep for: {mins // 60}h {mins % 60}m\n"
+                f"📨 Alerts queued: {s['queue_size']}\n\n"
+                f"`/sleep off` — wake + summary",
+                parse_mode="Markdown",
+            )
+        else:
+            bot.reply_to(
+                message,
+                "☀️ *Sleep mode: OFF*\n\n"
+                "`/sleep on`  — silence watcher alerts\n"
+                "`/sleep off` — wake + summary",
+                parse_mode="Markdown",
+            )
+
+
+# ---------- LOSS TRACKER COMMANDS (data-only) ----------
+
+@bot.message_handler(commands=['losses'])
+def handle_losses(message):
+    if not owner_only(message):
+        return
+    losses = loss_tracker.get_recent_losses(limit=20)
+    s = loss_tracker.stats()
+    header = (
+        f"📊 *Loss log*  ({s['total']} total | "
+        f"{s['real']} real / {s['unconfirmed']} unconfirmed | "
+        f"net ${s['total_pnl']:+.2f})\n"
+    )
+    bot.reply_to(
+        message,
+        header + "\n" + loss_tracker.format_losses_list(losses),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 # ---------- MEMORY COMMANDS (alert / check / scan history) ----------
