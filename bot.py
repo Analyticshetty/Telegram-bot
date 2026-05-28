@@ -810,6 +810,38 @@ def handle_lookup(message):
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 
+@bot.message_handler(commands=['redisping'])
+def handle_redisping(message):
+    """Diagnostic — shows whether Redis is actually working + which URL it's using."""
+    if not owner_only(message):
+        return
+    url_raw = (os.environ.get("REDIS_URL") or "").strip()
+    if not url_raw:
+        prefix = "(empty / not set)"
+    else:
+        prefix = url_raw[:25] + "..." if len(url_raw) > 25 else url_raw
+    lines = [
+        "🩺 *Redis diagnostic*",
+        "",
+        f"`REDIS_URL` env: `{prefix}`",
+        f"Length: {len(url_raw)} chars",
+        f"Starts with rediss://: {url_raw.startswith('rediss://')}",
+        f"Starts with redis://:  {url_raw.startswith('redis://')}",
+        "",
+    ]
+    # Try a real write + read
+    try:
+        _redis.set("redisping:test", "hello", ex=60)
+        val = _redis.get("redisping:test")
+        if val == "hello":
+            lines.append("✅ Write + read: SUCCESS")
+        else:
+            lines.append(f"⚠️ Read returned: {val!r}")
+    except Exception as e:
+        lines.append(f"❌ Write/read failed: `{type(e).__name__}: {str(e)[:100]}`")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
 @bot.message_handler(commands=['memstats'])
 def handle_memstats(message):
     if not owner_only(message):
