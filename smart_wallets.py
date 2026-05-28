@@ -17,7 +17,27 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-WALLETS_FILE = os.environ.get("WALLETS_FILE", "/data/smart_wallets.json")
+def _resolve_wallets_file() -> str:
+    """Pick a writable path. Tries /data (Railway volume) → /app (app dir) → /tmp."""
+    custom = os.environ.get("WALLETS_FILE")
+    if custom:
+        return custom
+    for path in ("/data/smart_wallets.json", "/app/smart_wallets_runtime.json", "/tmp/smart_wallets.json"):
+        try:
+            d = os.path.dirname(path) or "."
+            os.makedirs(d, exist_ok=True)
+            # Probe write
+            test = os.path.join(d, ".write_test")
+            with open(test, "w") as f:
+                f.write("ok")
+            os.remove(test)
+            return path
+        except Exception:
+            continue
+    return "./smart_wallets_runtime.json"
+
+
+WALLETS_FILE = _resolve_wallets_file()
 SOLANA_RPC   = "https://api.mainnet-beta.solana.com"
 CACHE_TTL    = 300   # seconds — 5 min
 TIMEOUT      = 8
@@ -48,6 +68,11 @@ def _read_json() -> dict:
 
 
 def _write_json(data: dict):
+    # Ensure parent dir exists (defensive — volume might be missing on a fresh Railway env)
+    try:
+        os.makedirs(os.path.dirname(WALLETS_FILE) or ".", exist_ok=True)
+    except Exception:
+        pass
     with open(WALLETS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
