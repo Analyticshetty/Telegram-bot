@@ -30,6 +30,7 @@ from datetime import datetime, timezone, timedelta
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
 OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
+HEALTHCHECK_URL   = os.environ.get("HEALTHCHECK_URL", "")  # healthchecks.io ping URL
 TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -399,6 +400,102 @@ def handle_discover(message):
     t.start()
 
 
+# ---------- HEALTHCHECK PING ----------
+
+def _healthcheck_loop():
+    """Ping healthchecks.io every 4.5 min. If bot crashes, pings stop → you get alerted."""
+    if not HEALTHCHECK_URL:
+        log.info("HEALTHCHECK_URL not set — dead-man's switch disabled.")
+        return
+    import requests as _req
+    log.info(f"Healthcheck ping started → {HEALTHCHECK_URL[:40]}...")
+    while True:
+        try:
+            _req.get(HEALTHCHECK_URL, timeout=5)
+        except Exception as e:
+            log.warning(f"Healthcheck ping failed (non-fatal): {e}")
+        time.sleep(270)  # 4.5 min — comfortably within the 5-min period
+
+
+# ---------- DAILY P&L SUMMARY ----------
+
+def _send_daily_summary():
+    """9am IST summary: capital, open positions, last 24h closed P&L."""
+    if not OWNER_TELEGRAM_ID:
+        return
+    try:
+        capital = float(_get_state("capital_usd", "0") or 0)
+        open_pos = position_tracker.list_open()
+        closed   = position_tracker.list_closed(limit=100)
+
+        # Filter to last 24h
+        cutoff = time.time() - 86400
+        recent = [p for p in closed if (p.get("closed_at") or 0) >= cutoff]
+
+        wins   = [p for p in recent if (p.get("pnl_usd") or 0) > 0]
+        losses = [p for p in recent if (p.get("pnl_usd") or 0) <= 0]
+        total_pnl = sum(p.get("pnl_usd") or 0 for p in recent)
+        pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+
+        lines = [
+            "☀️ *Good morning, Shashi — daily summary*\n",
+            f"💰 Capital: *${capital:,.2f}*",
+            f"📂 Open positions: *{len(open_pos)}*",
+            "",
+            f"*Last 24h closed trades:* {len(recent)} total",
+        ]
+
+        if recent:
+            lines.append(f"  ✅ Wins: {len(wins)}   ❌ Losses: {len(losses)}")
+            lines.append(f"  {pnl_emoji} Net P&L: *${total_pnl:+.2f}*")
+            for p in recent[:5]:  # show last 5
+                sym    = p.get("symbol") or p.get("mint", "")[:8]
+                pnl    = p.get("pnl_usd") or 0
+                reason = p.get("close_reason") or "manual"
+                e      = "✅" if pnl > 0 else "❌"
+                lines.append(f"  {e} {sym}: ${pnl:+.2f} ({reason})")
+            if len(recent) > 5:
+                lines.append(f"  _...and {len(recent)-5} more. Use /closed to see all._")
+        else:
+            lines.append("  No trades closed in last 24h.")
+
+        if open_pos:
+            lines.append("")
+            lines.append("*Currently open:*")
+            for p in open_pos[:3]:
+                sym  = p.get("symbol") or p.get("mint", "")[:8]
+                size = p.get("size_usd") or 0
+                lines.append(f"  • {sym} — ${size:.2f} in")
+            if len(open_pos) > 3:
+                lines.append(f"  _...{len(open_pos)-3} more. Use /positions._")
+
+        bot.send_message(
+            OWNER_TELEGRAM_ID,
+            "\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log.warning(f"Daily summary failed: {e}")
+
+
+def _daily_summary_loop():
+    """Fires _send_daily_summary every day at 9:00am IST."""
+    IST = timezone(timedelta(hours=5, minutes=30))
+    while True:
+        try:
+            now      = datetime.now(IST)
+            next_9am = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now >= next_9am:
+                next_9am += timedelta(days=1)
+            sleep_secs = (next_9am - now).total_seconds()
+            log.info(f"Daily summary: next fire in {sleep_secs/3600:.1f}h (9am IST)")
+            time.sleep(sleep_secs)
+            _send_daily_summary()
+        except Exception as e:
+            log.warning(f"Daily summary loop error: {e}")
+            time.sleep(3600)  # if something breaks, retry in 1h
+
+
 # ---------- WATCHER COMMANDS ----------
 
 def _watcher_alert(text: str):
@@ -432,6 +529,7 @@ def handle_watcher(message):
             bot.reply_to(message, "👁 Watcher already running.")
         else:
             watcher_module.start(_watcher_alert)
+            _set_state("watcher_auto_start", "1")   # remember: restart on next boot
             bot.reply_to(
                 message,
                 "👁 *Watcher ON* — scanning every 5 min.\n"
@@ -441,6 +539,7 @@ def handle_watcher(message):
             )
     elif action == "off":
         watcher_module.stop()
+        _set_state("watcher_auto_start", "0")       # remember: don't restart on next boot
         bot.reply_to(message, "🔕 Watcher stopped.")
     else:
         s = watcher_module.get_status()
@@ -1500,4 +1599,22 @@ try:
     print("Dev sell tracker started.")
 except Exception as e:
     log.warning(f"Dev sell tracker failed to start: {e}")
+
+# Auto-restart watcher if it was running before the last crash/redeploy
+try:
+    if _get_state("watcher_auto_start") == "1":
+        watcher_module.start(_watcher_alert)
+        print("Watcher auto-started (was running before restart).")
+    else:
+        print("Watcher not auto-started (was off or never set).")
+except Exception as e:
+    log.warning(f"Watcher auto-start failed: {e}")
+
+# Dead-man's switch — pings healthchecks.io every 4.5 min
+threading.Thread(target=_healthcheck_loop, daemon=True).start()
+
+# Daily 9am IST P&L summary
+threading.Thread(target=_daily_summary_loop, daemon=True).start()
+print("Daily summary thread started (fires at 9am IST).")
+
 bot.polling(none_stop=True, interval=0)
