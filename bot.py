@@ -1152,6 +1152,47 @@ def handle_import_callback(call):
         trade_import.delete_pending(user_id, msg_id)
         bot.answer_callback_query(call.id, "Done")
 
+# ---------- TELEGRAM COMMAND MENU ----------
+# Registers commands so they appear in Telegram's `/` autocomplete popup.
+
+def _register_telegram_commands():
+    try:
+        cmds = [
+            ("start",         "Show help menu"),
+            ("check",         "Rug check a Solana CA"),
+            ("scan",          "Find top 5 candidates"),
+            ("buy",           "Open a position (TP/SL auto-tracked)"),
+            ("sell",          "Close a position"),
+            ("positions",     "List open positions"),
+            ("closed",        "Last 20 closed positions"),
+            ("watcher",       "Watcher on/off/status"),
+            ("swfeed",        "Smart wallet feed on/off/status"),
+            ("sleep",         "Sleep mode on/off/status"),
+            ("alerts",        "Recent watcher alerts (search w/ keyword)"),
+            ("history",       "Your last 20 rug checks"),
+            ("lookup",        "Bot's memory on a specific CA"),
+            ("losses",        "Loss log with Fib/volume analysis"),
+            ("stats",         "Outcome stats (positions/watcher/narratives)"),
+            ("capital",       "Show/update capital ($)"),
+            ("addwallet",     "Add a smart wallet to track"),
+            ("removewallet",  "Remove a tracked wallet"),
+            ("listwallets",   "Show all tracked wallets"),
+            ("discoverwallet", "Auto-find smart money wallets"),
+            ("remember",      "Save a permanent fact/rule"),
+            ("memories",      "Show all permanent memories"),
+            ("forget",        "Delete a memory"),
+            ("memstats",      "Memory store size"),
+            ("reset",         "Wipe conversation memory"),
+        ]
+        bot.set_my_commands([tg_types.BotCommand(name, desc) for name, desc in cmds])
+        print(f"Registered {len(cmds)} commands with Telegram.")
+    except Exception as e:
+        log.warning(f"set_my_commands failed: {e}")
+
+
+_register_telegram_commands()
+
+
 # ---------- START ----------
 print("Bot is running with persistent memory (Redis) and image support...")
 # Auto-start position tracker — always watching open positions, no-op if none
