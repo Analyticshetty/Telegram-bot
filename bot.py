@@ -1379,6 +1379,16 @@ def handle_image(message):
         else:
             # Resolve symbol → candidate CAs
             candidates = trade_import.find_candidate_cas(parsed.get("symbol"), memory_store)
+
+            # Holding screens give us the market cap — float the closest-MC token
+            # to the top so the right one is candidate #1, not the highest-liquidity.
+            if parsed.get("screen_type") == "holding" and candidates:
+                target_mc = parsed.get("latest_mc_usd") or parsed.get("entry_mc_usd")
+                if target_mc:
+                    candidates.sort(
+                        key=lambda c: abs((c.get("mc_usd") or 0) - float(target_mc))
+                    )
+
             text = trade_import.format_confirmation(parsed, candidates)
 
             # Build inline keyboard
@@ -1495,6 +1505,19 @@ def handle_import_callback(call):
         action = (parsed.get("action") or "").lower()
         price  = parsed.get("price")
         size   = parsed.get("size_usd")
+
+        # Holding-screen imports carry no fill price/size — derive them now from
+        # the chosen CA's live price and the market-cap ratio off the screenshot.
+        if parsed.get("screen_type") == "holding":
+            live = position_tracker.get_live_price(mint)
+            derived = trade_import.reconstruct_holding(parsed, live)
+            if derived.get("error"):
+                bot.edit_message_text(f"❌ {derived['error']}", user_id, msg_id)
+                bot.answer_callback_query(call.id)
+                trade_import.delete_pending(user_id, msg_id)
+                return
+            price = derived["price"]
+            size  = derived["size_usd"]
 
         if action == "buy":
             if not size or size <= 0:
