@@ -1617,4 +1617,15 @@ threading.Thread(target=_healthcheck_loop, daemon=True).start()
 threading.Thread(target=_daily_summary_loop, daemon=True).start()
 print("Daily summary thread started (fires at 9am IST).")
 
-bot.infinity_polling(timeout=20, long_polling_timeout=15)
+# Wait for old Railway instance to fully stop before we start polling.
+# Without this, two instances overlap → 409 Conflict → crash.
+print("Waiting 15s for old instance to shut down before polling...")
+time.sleep(15)
+
+while True:
+    try:
+        print("Starting polling...")
+        bot.infinity_polling(timeout=20, long_polling_timeout=15)
+    except Exception as e:
+        log.warning(f"Polling crashed: {e}. Restarting in 15s...")
+        time.sleep(15)
