@@ -15,6 +15,7 @@ from smart_wallets import add_wallet, remove_wallet, load_wallets, _all_wallets
 from wallet_discovery import discover_wallets
 import watcher as watcher_module
 import memory_store
+import position_tracker
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
@@ -209,6 +210,11 @@ def handle_help(message):
         "🔍 `/discoverwallet` — auto-find smart money wallets.\n"
         "👁 `/watcher on/off/status` — narrative alert scanner.\n"
         "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
+        "*Position Tracker (24/7 TP/SL watchdog):*\n"
+        "📥 `/buy <CA> [size] [entry]` — open position (auto-pings TP1/TP2/SL)\n"
+        "📤 `/sell <CA>` — manually close\n"
+        "📂 `/positions` — list open positions\n"
+        "📁 `/closed` — last 20 closed\n\n"
         "*Memory (persists across redeploys):*\n"
         "🚨 `/alerts [keyword]` — last 20 watcher alerts (or search by word)\n"
         "📋 `/history` — your last 20 /check results\n"
@@ -490,6 +496,115 @@ def handle_capital(message):
         bot.reply_to(message, "❌ Invalid amount. Example: `/capital 50`", parse_mode="Markdown")
 
 
+# ---------- POSITION TRACKER COMMANDS ----------
+
+def _position_alert(text: str):
+    """Send TP/SL alert to owner."""
+    if not OWNER_TELEGRAM_ID:
+        return
+    try:
+        bot.send_message(OWNER_TELEGRAM_ID, text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning(f"Position alert send failed: {e}")
+
+
+def _default_size_usd() -> float:
+    """15% of capital, default sizing."""
+    try:
+        cap = float(_get_state("capital_usd", "25"))
+        return round(cap * 0.15, 2)
+    except Exception:
+        return 3.75
+
+
+@bot.message_handler(commands=['buy'])
+def handle_buy(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        bot.reply_to(message,
+            "Usage: `/buy <CA> [size_usd] [entry_price]`\n\n"
+            "Examples:\n"
+            "  `/buy 7xKj...pump` — uses 15% of capital, live price\n"
+            "  `/buy 7xKj...pump 5` — $5 size, live price\n"
+            "  `/buy 7xKj...pump 5 0.00012` — $5, manual entry price",
+            parse_mode="Markdown")
+        return
+    mint = parts[1].strip()
+    if not is_valid_solana_mint(mint):
+        bot.reply_to(message, "❌ Not a valid Solana CA.")
+        return
+    size = _default_size_usd()
+    entry = None
+    try:
+        if len(parts) >= 3:
+            size = float(parts[2].replace("$", ""))
+        if len(parts) >= 4:
+            entry = float(parts[3].replace("$", ""))
+    except ValueError:
+        bot.reply_to(message, "❌ Size/entry must be numbers.")
+        return
+
+    bot.reply_to(message, "📥 Opening position…")
+    result = position_tracker.open_position(mint, size, entry)
+    if not result.get("ok"):
+        bot.reply_to(message, f"❌ {result.get('error', 'unknown error')}")
+        return
+    p = result["position"]
+    bot.send_message(
+        message.chat.id,
+        f"✅ *Position opened — {p['symbol']}*\n\n"
+        + position_tracker.format_position(p, live_price=p["entry_price"])
+        + "\n\n_Tracker pinging you every 60s. TP1/TP2/SL fire automatically._",
+        parse_mode="Markdown", disable_web_page_preview=True,
+    )
+
+
+@bot.message_handler(commands=['sell'])
+def handle_sell(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/sell <CA>`", parse_mode="Markdown")
+        return
+    mint = parts[1].strip()
+    result = position_tracker.close_position(mint, reason="manual")
+    if not result.get("ok"):
+        bot.reply_to(message, f"❌ {result.get('error')}")
+        return
+    p = result["position"]
+    pnl = p.get("pnl_usd", 0)
+    pnl_pct = p.get("pnl_pct", 0)
+    icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+    bot.reply_to(
+        message,
+        f"{icon} *Closed {p['symbol']}*\n"
+        f"Exit: ${p['exit_price']:.8f}\n"
+        f"P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=['positions'])
+def handle_positions(message):
+    if not owner_only(message):
+        return
+    positions = position_tracker.list_open()
+    bot.reply_to(message, position_tracker.format_open_list(positions),
+                 parse_mode="Markdown", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['closed'])
+def handle_closed(message):
+    if not owner_only(message):
+        return
+    positions = position_tracker.list_closed(limit=20)
+    bot.reply_to(message, position_tracker.format_closed_list(positions),
+                 parse_mode="Markdown", disable_web_page_preview=True)
+
+
 # ---------- MEMORY COMMANDS (alert / check / scan history) ----------
 
 def _ago(ts: int) -> str:
@@ -750,4 +865,10 @@ def handle_image(message):
 
 # ---------- START ----------
 print("Bot is running with persistent memory (Redis) and image support...")
+# Auto-start position tracker — always watching open positions, no-op if none
+try:
+    position_tracker.start(_position_alert)
+    print(f"Position tracker started. Open positions: {len(position_tracker.list_open())}")
+except Exception as e:
+    log.warning(f"Position tracker failed to start: {e}")
 bot.polling(none_stop=True, interval=0)
