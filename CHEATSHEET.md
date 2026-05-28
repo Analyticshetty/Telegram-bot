@@ -14,6 +14,22 @@ Bot: **@SSHETTY_bot** on Telegram
 
 ---
 
+## 📡 SIGNAL (scored lean + tracked accuracy)
+
+| Command | What |
+|---|---|
+| `/signal <CA>` | 0-100 score → BULLISH / NEUTRAL / BEARISH, with every point explained |
+| `/signal stats` | YOUR real hit rate per lean (the number paid tools hide) |
+| 📸 Photo + caption "chart" | Reads the token *identity* off the image, then scores it |
+| `/backtest <CA>` | Instant grade — replays one coin's past price, no 6h wait |
+| `/backtest sweep` | Same across several trending coins for a bigger sample |
+
+**Backtest = a quick smell test, not proof.** It only replays past *price/volume* (the part free APIs allow), so it tests the **momentum half** of the score — NOT the rug-safety half. Below 55% = no edge. A good number here does NOT mean the full `/signal` works; only the live 6h tracker proves that.
+
+**Read it honestly:** the score is on-chain + flow data, not a crystal ball. Until ~20 signals of a lean resolve, confidence shows **UNKNOWN**. Below 55% hit rate = no edge. It reads the token's *identity* from a chart photo — it never reads the candles to "predict." No order placement (rule #2).
+
+---
+
 ## 📥 OPEN & MANAGE TRADES
 
 | Command | What |
@@ -26,6 +42,16 @@ Bot: **@SSHETTY_bot** on Telegram
 | `/closed` | Last 20 closed trades with P&L |
 | 📸 Photo + caption "buy" | Vision parses Bitget screenshot → opens trade |
 | 📸 Photo + caption "sell" | Same → closes trade |
+
+---
+
+## 🚨 DEV SELL TRACKER (auto-starts)
+
+| Command | What |
+|---|---|
+| `/devfeed on` / `off` / `status` | Watch top 50 pump.fun coins every 3min — alerts when token *creator* sells |
+
+**When you get a dev sell alert:** The dev is exiting. Price often pumps briefly on FOMO, then dumps hard. If you're holding → consider exiting before the bounce, not after. Advisory only — some devs sell partially, not a full rug.
 
 ---
 

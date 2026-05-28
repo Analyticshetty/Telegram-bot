@@ -21,6 +21,9 @@ import loss_tracker
 import trade_import
 import stats as stats_module
 import smart_wallet_feed
+import signal_engine
+import backtest as backtest_module
+import dev_tracker
 from telebot import types as tg_types
 from datetime import datetime, timezone, timedelta
 
@@ -202,6 +205,10 @@ def handle_help(message):
         "🛡 Paste any Solana CA — auto rug-check.\n"
         "🛡 `/check <mint>` — explicit rug-check.\n"
         "🔍 `/scan` — Bitget-Latest-equivalent token scanner.\n"
+        "📡 `/signal <CA>` — scored direction lean + your tracked accuracy. Send a chart photo w/ caption \"chart\".\n"
+        "📡 `/signal stats` — your real signal hit rate.\n"
+        "⏪ `/backtest <CA>` or `/backtest sweep` — instant momentum backtest on past price (no 6h wait).\n"
+        "🚨 `/devfeed on/off/status` — dev sell tracker (alerts when token creator sells on pump.fun).\n"
         "🧹 `/reset` — wipe conversation memory.\n"
         "🧠 `/remember <fact>` — save a permanent rule or fact.\n"
         "📋 `/memories` — show all permanent memories.\n"
@@ -1032,6 +1039,59 @@ def handle_swfeed(message):
         )
 
 
+# ---------- DEV TRACKER ----------
+
+def _dev_tracker_alert(text: str):
+    """Send dev-sell alert to owner — sleep-aware."""
+    if not OWNER_TELEGRAM_ID:
+        return
+    if sleep_mode.queue_alert(text):
+        return
+    try:
+        bot.send_message(OWNER_TELEGRAM_ID, text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning(f"dev_tracker alert send failed: {e}")
+
+
+@bot.message_handler(commands=['devfeed'])
+def handle_devfeed(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    action = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if action == "on":
+        if dev_tracker.is_running():
+            bot.reply_to(message, "🚨 Dev sell tracker already running.")
+        else:
+            dev_tracker.start(_dev_tracker_alert)
+            bot.reply_to(
+                message,
+                "🚨 *Dev Sell Tracker ON*\n\n"
+                f"Watching top {dev_tracker.TOP_COINS} pump.fun coins by MC every {dev_tracker.SCAN_INTERVAL//60} min.\n"
+                "Alert fires when the token *creator wallet* sells.\n\n"
+                "Stop: `/devfeed off`",
+                parse_mode="Markdown",
+            )
+    elif action == "off":
+        dev_tracker.stop()
+        bot.reply_to(message, "🔕 Dev sell tracker stopped.")
+    else:
+        s = dev_tracker.get_status()
+        status_str = "✅ Running" if s["running"] else "⛔ Stopped"
+        scan_str   = f"Last scan {s['mins_ago']}m ago | {s['scans']} total" if s["mins_ago"] else "No scan yet"
+        bot.reply_to(
+            message,
+            f"🚨 *Dev Sell Tracker:* {status_str}\n\n"
+            f"Watching: top {s['watching']} pump.fun coins\n"
+            f"Interval: every {s['interval_m']} min\n"
+            f"{scan_str}\n\n"
+            f"`/devfeed on` — start\n"
+            f"`/devfeed off` — stop",
+            parse_mode="Markdown",
+        )
+
+
 # ---------- STATS COMMAND ----------
 
 @bot.message_handler(commands=['stats'])
@@ -1053,9 +1113,135 @@ def handle_stats(message):
     bot.reply_to(message, text, parse_mode="Markdown", disable_web_page_preview=True)
 
 
+# ---------- SIGNAL COMMAND ----------
+@bot.message_handler(commands=['signal'])
+def handle_signal(message):
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if arg.lower().startswith("stat"):
+        text = signal_engine.format_stats(signal_engine.overall_stats())
+        bot.reply_to(message, text, parse_mode="Markdown", disable_web_page_preview=True)
+        return
+
+    if not arg:
+        bot.reply_to(
+            message,
+            "Usage: `/signal <SOLANA_CA>` — scored direction lean + tracked accuracy.\n"
+            "`/signal stats` — your real hit rate.\n\n"
+            "_Not a prediction. A transparent score on real on-chain data, scored against "
+            "what the token actually does 6h later._",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not is_valid_solana_mint(arg):
+        bot.reply_to(message, "❌ That doesn't look like a Solana mint address (base58, 32–44 chars).")
+        return
+
+    _run_signal_and_reply(message, arg)
+
+
+def _run_signal_and_reply(message, mint: str):
+    bot.reply_to(message, f"📡 Scoring `{mint[:8]}...{mint[-6:]}`...", parse_mode="Markdown")
+    try:
+        sig = signal_engine.generate_signal(mint)
+        bot.send_message(
+            message.chat.id,
+            signal_engine.format_signal(sig),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Signal failed: {e.__class__.__name__}: {e}")
+
+
+# ---------- BACKTEST COMMAND ----------
+@bot.message_handler(commands=['backtest'])
+def handle_backtest(message):
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if arg.lower().startswith("sweep"):
+        bot.reply_to(message, "⏪ Backtesting momentum across trending coins… (10-20s)")
+        try:
+            res = backtest_module.backtest_sweep()
+            bot.send_message(message.chat.id, backtest_module.format_sweep(res),
+                             parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            bot.reply_to(message, f"⚠️ Sweep failed: {e.__class__.__name__}: {e}")
+        return
+
+    if not arg:
+        bot.reply_to(
+            message,
+            "Usage:\n`/backtest <SOLANA_CA>` — replay one coin's price history, grade the momentum score instantly.\n"
+            "`/backtest sweep` — same across several trending coins.\n\n"
+            "_Tests the momentum half of /signal only (the part free APIs let us replay). Not proof the full signal works._",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not is_valid_solana_mint(arg):
+        bot.reply_to(message, "❌ That doesn't look like a Solana mint address (base58, 32–44 chars).")
+        return
+
+    bot.reply_to(message, f"⏪ Backtesting `{arg[:8]}...{arg[-4:]}`…", parse_mode="Markdown")
+    try:
+        res = backtest_module.backtest_token(arg)
+        bot.send_message(message.chat.id, backtest_module.format_token_backtest(res),
+                         parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Backtest failed: {e.__class__.__name__}: {e}")
+
+
 # ---------- IMAGE HANDLER ----------
 
 TRADE_KEYWORDS = {"trade", "buy", "sell", "bitget", "order", "import", "filled", "position"}
+CHART_KEYWORDS = {"chart", "signal", "predict", "direction", "analyze", "analyse"}
+
+CHART_EXTRACT_PROMPT = """You are looking at a screenshot of a crypto token chart or token page.
+
+Your ONLY job is to identify WHICH token this is. Do NOT predict price, direction, or anything else.
+
+Return ONLY a JSON object:
+  - ca: the Solana contract/mint address if one is visible (base58, 32-44 chars), else null
+  - symbol: the token ticker without /USDT (e.g. "WIF", "BONK"), else null
+
+If you cannot identify the token at all, return: {"error": "no token identified"}
+
+Examples:
+  {"ca": "EKpQGS...", "symbol": "WIF"}
+  {"ca": null, "symbol": "BONK"}
+
+Return ONLY the JSON object. No markdown, no explanation, no price prediction."""
+
+
+def _extract_chart_identity(image_b64: str) -> dict:
+    """Vision extracts ONLY the token identity (CA/symbol) from a chart image.
+    Deliberately never reads candles or predicts direction — that's the snake-oil part."""
+    try:
+        response = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                    {"type": "text", "text": CHART_EXTRACT_PROMPT},
+                ],
+            }],
+            max_tokens=200,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        return json.loads(raw)
+    except Exception as e:
+        log.warning(f"chart identity extract failed: {e}")
+        return {"error": f"extract failed: {e.__class__.__name__}"}
 
 
 def _looks_like_trade_request(caption: str) -> bool:
@@ -1063,6 +1249,13 @@ def _looks_like_trade_request(caption: str) -> bool:
         return False
     words = {w.strip(".,!?:;").lower() for w in caption.split()}
     return bool(words & TRADE_KEYWORDS)
+
+
+def _looks_like_chart_request(caption: str) -> bool:
+    if not caption:
+        return False
+    words = {w.strip(".,!?:;").lower() for w in caption.split()}
+    return bool(words & CHART_KEYWORDS)
 
 
 @bot.message_handler(content_types=['photo'])
@@ -1108,6 +1301,44 @@ def handle_image(message):
                 "candidates": candidates,
             })
             return  # done — confirmation flow handles the rest
+
+    # Chart / signal screenshot: identify the token, then run the scored signal.
+    if _looks_like_chart_request(caption):
+        bot.reply_to(message, "📡 Reading the token identity off this chart (not the candles)…")
+        ident = _extract_chart_identity(image_b64)
+
+        ca = (ident.get("ca") or "").strip() if isinstance(ident, dict) else ""
+        if ca and is_valid_solana_mint(ca):
+            _run_signal_and_reply(message, ca)
+            return
+
+        symbol = ident.get("symbol") if isinstance(ident, dict) else None
+        if symbol:
+            candidates = trade_import.find_candidate_cas(symbol, memory_store)
+            if candidates:
+                chosen = candidates[0]
+                if len(candidates) > 1:
+                    bot.send_message(
+                        user_id,
+                        f"🔎 Found *{len(candidates)}* '{symbol}' tokens — scoring the top one by liquidity.\n"
+                        f"For a specific one use `/signal <CA>`.",
+                        parse_mode="Markdown",
+                    )
+                _run_signal_and_reply(message, chosen["mint"])
+                return
+            bot.send_message(
+                user_id,
+                f"⚠️ Couldn't resolve '{symbol}' to a Solana CA. Send the CA: `/signal <CA>`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        bot.send_message(
+            user_id,
+            "⚠️ Couldn't identify the token from this image. Send the CA: `/signal <CA>`.",
+            parse_mode="Markdown",
+        )
+        return
 
     # Default behavior: describe the image
     describe_caption = caption or "What is in this image? Describe it in detail."
@@ -1212,6 +1443,9 @@ def _register_telegram_commands():
             ("start",         "Show help menu"),
             ("check",         "Rug check a Solana CA"),
             ("scan",          "Find top 5 candidates"),
+            ("signal",        "Scored direction lean + tracked accuracy"),
+            ("backtest",      "Instant momentum backtest (CA or 'sweep')"),
+            ("devfeed",       "Dev sell tracker on/off/status"),
             ("buy",           "Open a position (TP/SL auto-tracked)"),
             ("sell",          "Close a position"),
             ("positions",     "List open positions"),
@@ -1259,4 +1493,11 @@ try:
     print("Smart wallet feed started.")
 except Exception as e:
     log.warning(f"Smart wallet feed failed to start: {e}")
+
+# Auto-start dev sell tracker
+try:
+    dev_tracker.start(_dev_tracker_alert)
+    print("Dev sell tracker started.")
+except Exception as e:
+    log.warning(f"Dev sell tracker failed to start: {e}")
 bot.polling(none_stop=True, interval=0)
