@@ -1,0 +1,431 @@
+"""
+Smart Wallet Real-Time Feed (Module #6) — the goldmine signal.
+
+Background thread continuously polls all 331 smart wallets. When 2+ wallets
+buy the same fresh Solana CA within 10 minutes → fire convergence alert.
+
+Architecture (designed for $0/mo on free tiers):
+  - Signature polling: PUBLIC Solana RPC (free, rate-limited).
+    Round-robin through all wallets, ~3s/wallet. Full cycle ~17 min.
+  - Transaction parsing: Helius enhanced endpoint (100k credits/mo).
+    Only called when wallet has NEW signatures since last check —
+    quiet wallets cost zero credits.
+
+Storage (Redis):
+  sw_feed:cursor:{wallet}    = JSON {last_sig, last_check_ts}
+  sw_feed:buys:{ca}          = JSON list of {wallet, label, ts}, TTL 2h
+  sw_feed:alerted:{ca}       = "1", TTL 24h (dedupe alert)
+  sw_feed:status             = JSON status snapshot
+"""
+
+import os
+import json
+import time
+import logging
+import threading
+import requests
+import redis
+
+log = logging.getLogger(__name__)
+
+_redis = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    decode_responses=True,
+    ssl_cert_reqs=None,
+)
+
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+
+# ---------- CONFIG ----------
+WALLET_POLL_DELAY = 3            # seconds between wallet checks (public RPC kindness)
+SIG_LIMIT         = 10           # latest 10 sigs per wallet
+WINDOW_SECONDS    = 600          # 10 min convergence window
+MIN_CONVERGENCE   = 2            # 2 wallets = signal
+FRESH_AGE_MAX_MIN = 360          # only alert on tokens < 6h old
+ALERT_DEDUPE_TTL  = 86400        # 24h
+BUYS_TTL          = 7200         # 2h memory of recent buys per CA
+TIMEOUT           = 8
+
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+HELIUS_TX  = "https://api.helius.xyz/v0/transactions"
+
+# Mints to ignore (SOL, common stables) — buying these isn't a memecoin signal
+SKIP_MINTS = {
+    "So11111111111111111111111111111111111111112",   # wSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+}
+
+# ---------- STATE ----------
+_running    = False
+_thread     = None
+_alert_fn   = None  # set on start
+_last_cycle_alerts = 0
+_last_cycle_end_ts = None
+_cycles_completed  = 0
+
+
+# ---------- RPC HELPERS ----------
+
+def _rpc_get_signatures(wallet: str, limit: int = SIG_LIMIT) -> list:
+    """Public RPC — getSignaturesForAddress. Returns list of {signature, blockTime, ...}."""
+    try:
+        r = requests.post(
+            SOLANA_RPC,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [wallet, {"limit": limit}],
+            },
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return []
+        return (r.json() or {}).get("result") or []
+    except Exception as e:
+        log.warning(f"sw_feed sig fetch failed for {wallet[:8]}: {e}")
+        return []
+
+
+def _helius_parse(signatures: list) -> list:
+    """Batch-parse signatures via Helius. Returns enriched tx list."""
+    if not HELIUS_API_KEY or not signatures:
+        return []
+    try:
+        r = requests.post(
+            f"{HELIUS_TX}?api-key={HELIUS_API_KEY}",
+            json={"transactions": signatures},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.warning(f"Helius parse returned {r.status_code}")
+            return []
+        return r.json() or []
+    except Exception as e:
+        log.warning(f"sw_feed Helius parse failed: {e}")
+        return []
+
+
+def _extract_buys_for_wallet(parsed_txs: list, wallet: str) -> list:
+    """From parsed Helius txs, extract memecoin BUYS by this wallet.
+    A buy = wallet's SPL token balance increased for a non-skip mint."""
+    buys = []
+    for tx in parsed_txs:
+        try:
+            ts = tx.get("timestamp") or 0
+            # Helius enhanced format has tokenTransfers array
+            transfers = tx.get("tokenTransfers") or []
+            for t in transfers:
+                if (t.get("toUserAccount") or "").lower() != wallet.lower():
+                    continue
+                mint = t.get("mint")
+                if not mint or mint in SKIP_MINTS:
+                    continue
+                # Skip dust amounts
+                amount = float(t.get("tokenAmount") or 0)
+                if amount <= 0:
+                    continue
+                buys.append({"mint": mint, "amount": amount, "ts": ts, "sig": tx.get("signature")})
+        except Exception:
+            continue
+    return buys
+
+
+# ---------- CONVERGENCE TRACKING ----------
+
+def _record_buy(mint: str, wallet_addr: str, wallet_label: str, ts: int) -> list:
+    """Add a buy to the recent-buys list for this CA. Returns updated list."""
+    key = f"sw_feed:buys:{mint}"
+    try:
+        raw = _redis.get(key)
+        buys = json.loads(raw) if raw else []
+    except Exception:
+        buys = []
+    # Skip duplicate (same wallet, same CA, within last 5 min)
+    now = time.time()
+    cutoff = now - WINDOW_SECONDS
+    buys = [b for b in buys if b.get("ts", 0) >= cutoff]
+    if not any(b.get("wallet") == wallet_addr for b in buys):
+        buys.append({"wallet": wallet_addr, "label": wallet_label, "ts": ts})
+        try:
+            _redis.set(key, json.dumps(buys), ex=BUYS_TTL)
+        except Exception:
+            pass
+    return buys
+
+
+def _has_been_alerted(mint: str) -> bool:
+    try:
+        return _redis.get(f"sw_feed:alerted:{mint}") == "1"
+    except Exception:
+        return False
+
+
+def _mark_alerted(mint: str):
+    try:
+        _redis.set(f"sw_feed:alerted:{mint}", "1", ex=ALERT_DEDUPE_TTL)
+    except Exception:
+        pass
+
+
+def _get_cursor(wallet: str) -> dict:
+    try:
+        raw = _redis.get(f"sw_feed:cursor:{wallet}")
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _save_cursor(wallet: str, last_sig: str):
+    try:
+        _redis.set(
+            f"sw_feed:cursor:{wallet}",
+            json.dumps({"last_sig": last_sig, "last_check_ts": int(time.time())}),
+        )
+    except Exception:
+        pass
+
+
+# ---------- TOKEN FRESHNESS ----------
+
+def _token_age_minutes(mint: str) -> float | None:
+    """Quick DEXScreener fetch to gate alerts to fresh tokens."""
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None
+        pairs = (r.json() or {}).get("pairs") or []
+        if not pairs:
+            return None
+        pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+        created_ms = pairs[0].get("pairCreatedAt")
+        if not created_ms:
+            return None
+        return (time.time() * 1000 - created_ms) / 60000
+    except Exception:
+        return None
+
+
+# ---------- ALERT BUILDER ----------
+
+def _build_alert(mint: str, buys: list, age_min: float | None, rug_result: dict | None) -> str:
+    """Format the convergence alert."""
+    n = len(buys)
+    labels = ", ".join(b.get("label", "?") for b in buys[:5])
+    # Time spread between first and last buy in window
+    timestamps = sorted([b.get("ts", 0) for b in buys])
+    spread_secs = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0
+
+    age_str = "unknown"
+    if age_min is not None:
+        age_str = f"{age_min:.0f}min" if age_min < 60 else f"{age_min/60:.1f}h"
+
+    verdict = "UNCHECKED"
+    verdict_icon = "⚪"
+    extras = ""
+    if rug_result:
+        verdict = rug_result.get("verdict") or "UNCHECKED"
+        verdict_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(verdict, "⚪")
+        d = rug_result.get("details") or {}
+        mc  = d.get("market_cap") or 0
+        liq = d.get("liquidity_usd") or 0
+        sym = d.get("symbol") or "?"
+        extras = (
+            f"\n📊 Symbol: *{sym}*\n"
+            f"💰 MC: ${mc:,.0f}  |  💧 Liq: ${liq:,.0f}"
+        )
+
+    spread_str = f"{spread_secs // 60}m {spread_secs % 60}s" if spread_secs >= 60 else f"{spread_secs}s"
+
+    return (
+        f"🐋🐋 *SMART WALLET CONVERGENCE*\n\n"
+        f"📋 CA: `{mint}`\n"
+        f"⏱ Token age: {age_str}\n"
+        f"🐋 *{n} smart wallets bought within {spread_str}*\n"
+        f"   {labels}{extras}\n"
+        f"🛡 Rug check: {verdict_icon} {verdict}\n\n"
+        f"_This is the strongest signal the bot produces. "
+        f"Smart money converging on a fresh CA in real time._"
+    )
+
+
+# ---------- SCAN ONE WALLET ----------
+
+def _scan_wallet(wallet: dict) -> int:
+    """Returns number of new buys recorded for this wallet."""
+    addr = wallet.get("address")
+    label = wallet.get("label") or addr[:6]
+    if not addr or addr.startswith("TODO"):
+        return 0
+
+    cursor = _get_cursor(addr)
+    last_sig = cursor.get("last_sig")
+
+    sigs = _rpc_get_signatures(addr, limit=SIG_LIMIT)
+    if not sigs:
+        return 0
+
+    # Find sigs newer than cursor
+    new_sigs = []
+    for s in sigs:
+        if last_sig and s.get("signature") == last_sig:
+            break
+        # Skip very old sigs (>20 min) to avoid replaying history on first run
+        bt = s.get("blockTime") or 0
+        if bt and (time.time() - bt) > 1200:
+            continue
+        new_sigs.append(s.get("signature"))
+
+    if not new_sigs:
+        # Update cursor so we don't keep re-checking the same head
+        if sigs:
+            _save_cursor(addr, sigs[0].get("signature"))
+        return 0
+
+    # Parse via Helius
+    parsed = _helius_parse(new_sigs[:5])  # cap to limit Helius spend
+    buys = _extract_buys_for_wallet(parsed, addr)
+
+    # Record + check convergence
+    recorded = 0
+    for b in buys:
+        mint = b["mint"]
+        ts   = b["ts"] or int(time.time())
+        updated_buys = _record_buy(mint, addr, label, ts)
+        recorded += 1
+
+        # Convergence check
+        if len(updated_buys) >= MIN_CONVERGENCE and not _has_been_alerted(mint):
+            _trigger_convergence_alert(mint, updated_buys)
+
+    # Update cursor to newest sig
+    _save_cursor(addr, sigs[0].get("signature"))
+    return recorded
+
+
+def _trigger_convergence_alert(mint: str, buys: list):
+    """Fresh-token gate + rug check + send."""
+    # Fresh-only gate
+    age_min = _token_age_minutes(mint)
+    if age_min is not None and age_min > FRESH_AGE_MAX_MIN:
+        log.info(f"sw_feed skipping stale token {mint} (age {age_min:.0f}min)")
+        return
+
+    # Run rug check — defer import to avoid circular
+    rug_result = None
+    try:
+        from rug_check import check_token
+        rug_result = check_token(mint)
+        # Don't alert on RED
+        if rug_result.get("verdict") == "RED":
+            log.info(f"sw_feed convergence on {mint} but RED — suppressed")
+            _mark_alerted(mint)  # don't keep re-checking it
+            return
+    except Exception as e:
+        log.warning(f"sw_feed rug_check failed for {mint}: {e}")
+
+    alert = _build_alert(mint, buys, age_min, rug_result)
+    if _alert_fn:
+        try:
+            _alert_fn(alert)
+        except Exception as e:
+            log.warning(f"sw_feed alert send failed: {e}")
+
+    _mark_alerted(mint)
+
+    # Persist to memory_store so it shows up in /alerts /lookup
+    try:
+        import memory_store
+        d = (rug_result or {}).get("details") or {}
+        memory_store.save_alert(
+            narrative="smart_wallet_convergence",
+            mint=mint,
+            symbol=d.get("symbol"),
+            verdict=(rug_result or {}).get("verdict") or "UNCHECKED",
+            mc=d.get("market_cap"),
+            liq=d.get("liquidity_usd"),
+            twitter_ok=None,
+            smart_wallets=len(buys),
+            cluster_size=len(buys),
+            full_text=alert,
+        )
+    except Exception as e:
+        log.warning(f"sw_feed memory_store save failed: {e}")
+
+    global _last_cycle_alerts
+    _last_cycle_alerts += 1
+
+
+# ---------- MAIN LOOP ----------
+
+def _loop():
+    global _running, _last_cycle_alerts, _last_cycle_end_ts, _cycles_completed
+    log.info("Smart wallet feed started.")
+    while _running:
+        try:
+            # Defer import to break circular ref at import-time
+            from smart_wallets import load_wallets
+            wallets = load_wallets()
+            if not wallets:
+                time.sleep(60)
+                continue
+
+            _last_cycle_alerts = 0
+            for w in wallets:
+                if not _running:
+                    break
+                try:
+                    _scan_wallet(w)
+                except Exception as e:
+                    log.warning(f"sw_feed scan_wallet error: {e}")
+                # Polite pause between wallets
+                for _ in range(WALLET_POLL_DELAY):
+                    if not _running:
+                        break
+                    time.sleep(1)
+
+            _last_cycle_end_ts = time.time()
+            _cycles_completed += 1
+            log.info(f"sw_feed cycle #{_cycles_completed} done — {_last_cycle_alerts} convergence alerts")
+
+        except Exception as e:
+            log.warning(f"sw_feed loop error: {e}")
+            time.sleep(30)
+    log.info("Smart wallet feed stopped.")
+
+
+# ---------- PUBLIC API ----------
+
+def start(alert_fn):
+    global _running, _thread, _alert_fn
+    if _running:
+        return False
+    _alert_fn = alert_fn
+    _running  = True
+    _thread   = threading.Thread(target=_loop, daemon=True)
+    _thread.start()
+    return True
+
+
+def stop():
+    global _running
+    _running = False
+
+
+def is_running() -> bool:
+    return _running
+
+
+def get_status() -> dict:
+    mins_ago = None
+    if _last_cycle_end_ts:
+        mins_ago = round((time.time() - _last_cycle_end_ts) / 60, 1)
+    return {
+        "running":           _running,
+        "cycles_completed":  _cycles_completed,
+        "last_cycle_alerts": _last_cycle_alerts,
+        "mins_since_cycle":  mins_ago,
+    }

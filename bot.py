@@ -20,6 +20,7 @@ import sleep_mode
 import loss_tracker
 import trade_import
 import stats as stats_module
+import smart_wallet_feed
 from telebot import types as tg_types
 from datetime import datetime, timezone, timedelta
 
@@ -226,6 +227,9 @@ def handle_help(message):
         "*Trade import + Stats:*\n"
         "📸 Send Bitget screenshot with caption \"buy\"/\"sell\"/\"trade\" — auto-parse + open/close position\n"
         "📈 `/stats [positions|watcher|narratives]` — outcome aggregates + win rate\n\n"
+        "*Smart Wallet Feed (24/7 convergence detector):*\n"
+        "🐋🐋 Auto-alerts when 2+ smart wallets buy same fresh CA within 10 min\n"
+        "`/swfeed on/off/status` — control the feed\n\n"
         "*Memory (persists across redeploys):*\n"
         "🚨 `/alerts [keyword]` — last 20 watcher alerts (or search by word)\n"
         "📋 `/history` — your last 20 /check results\n"
@@ -925,6 +929,61 @@ def chat_with_tools(messages):
             })
     return "I tried searching but ran out of steps. Try rephrasing the question."
 
+# ---------- SMART WALLET FEED COMMAND ----------
+
+def _sw_feed_alert(text: str):
+    """Send smart-wallet convergence alert to owner — sleep-aware."""
+    if not OWNER_TELEGRAM_ID:
+        return
+    if sleep_mode.queue_alert(text):
+        return
+    try:
+        bot.send_message(OWNER_TELEGRAM_ID, text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning(f"sw_feed alert send failed: {e}")
+
+
+@bot.message_handler(commands=['swfeed'])
+def handle_swfeed(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    action = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if action == "on":
+        if smart_wallet_feed.is_running():
+            bot.reply_to(message, "🐋 Smart wallet feed already running.")
+        else:
+            smart_wallet_feed.start(_sw_feed_alert)
+            bot.reply_to(
+                message,
+                "🐋 *Smart Wallet Feed ON*\n\n"
+                "Polling all 331 wallets continuously (~17min full cycle).\n"
+                "Alert fires when *2+ wallets* buy the same fresh CA within 10 min.\n\n"
+                "Stop: `/swfeed off`",
+                parse_mode="Markdown",
+            )
+    elif action == "off":
+        smart_wallet_feed.stop()
+        bot.reply_to(message, "🔕 Smart wallet feed stopped.")
+    else:
+        s = smart_wallet_feed.get_status()
+        status_str = "✅ Running" if s["running"] else "⛔ Stopped"
+        cycle_str = "Not done yet" if s["cycles_completed"] == 0 else (
+            f"{s['cycles_completed']} cycles done | "
+            f"last cycle {s['mins_since_cycle']}min ago | "
+            f"{s['last_cycle_alerts']} alerts"
+        )
+        bot.reply_to(
+            message,
+            f"🐋 *Smart Wallet Feed:* {status_str}\n\n"
+            f"{cycle_str}\n\n"
+            f"`/swfeed on` — start\n"
+            f"`/swfeed off` — stop",
+            parse_mode="Markdown",
+        )
+
+
 # ---------- STATS COMMAND ----------
 
 @bot.message_handler(commands=['stats'])
@@ -1104,4 +1163,11 @@ try:
     print(f"Position tracker started. Open positions: {len(position_tracker.list_open())}")
 except Exception as e:
     log.warning(f"Position tracker failed to start: {e}")
+
+# Auto-start smart wallet feed — continuous convergence detection
+try:
+    smart_wallet_feed.start(_sw_feed_alert)
+    print("Smart wallet feed started.")
+except Exception as e:
+    log.warning(f"Smart wallet feed failed to start: {e}")
 bot.polling(none_stop=True, interval=0)
