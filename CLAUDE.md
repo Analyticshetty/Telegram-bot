@@ -18,8 +18,9 @@ Capital history: $30 → $150 → $10 → $25. Pattern: sleep-deprived dopamine 
 |---|---|---|
 | 9-engine rug check | `/check <CA>` or paste CA | ✅ |
 | Position tracker (TP1/TP2/SL) | `/buy` `/sell` `/positions` | ✅ |
-| Watcher (narrative alerts) | `/watcher on/off` | ✅ turn on each session |
+| Watcher (narrative alerts) | `/watcher on/off` | ✅ **auto-restarts on crash** |
 | Smart wallet feed (204 wallets) | `/swfeed status` | ✅ auto-starts |
+| Smart wallet signal (2+ wallets, any time/age) | automatic | ✅ |
 | Dev sell tracker | `/devfeed status` | ✅ auto-starts |
 | Signal scoring + accuracy tracker | `/signal <CA>`, `/signal stats` | ✅ |
 | Momentum backtest | `/backtest <CA>`, `/backtest sweep` | ✅ |
@@ -27,6 +28,8 @@ Capital history: $30 → $150 → $10 → $25. Pattern: sleep-deprived dopamine 
 | Stats, losses, history | `/stats` `/losses` `/history` | ✅ |
 | Trade import (Bitget screenshot) | Photo + caption "buy/sell" | ✅ |
 | Chart photo → signal | Photo + caption "chart" | ✅ |
+| Dead-man's switch | healthchecks.io | ✅ Telegram + email alerts |
+| Daily 9am IST P&L summary | automatic | ✅ |
 
 ## Non-Negotiable Rules
 1. **Brutal honesty. No sugarcoating.**
@@ -42,8 +45,9 @@ Capital history: $30 → $150 → $10 → $25. Pattern: sleep-deprived dopamine 
 
 ## Session Checklist
 - [ ] Confirm capital (`/capital` or ask)
-- [ ] Check Railway trial — ~$5/mo Hobby or trial credit remaining
 - [ ] `/swfeed status` and `/devfeed status` — both should be running
+- [ ] Watcher auto-restarts now — confirm with `/watcher status`
+- [ ] Check healthchecks.io is green (bot alive)
 - [ ] Ask what Shashi wants to work on
 
 ## Key APIs (all free)
