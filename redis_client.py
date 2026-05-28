@@ -32,7 +32,7 @@ def get_redis():
     """Return a Redis client. Never raises at module-load time."""
     url = _resolve_url()
     try:
-        return redis.from_url(url, decode_responses=True, ssl_cert_reqs=None)
+        return redis.from_url(url, decode_responses=True)
     except Exception as e:
         log.warning(f"Redis client init failed ({e}); using localhost fallback")
-        return redis.from_url("redis://localhost:6379", decode_responses=True, ssl_cert_reqs=None)
+        return redis.from_url("redis://localhost:6379", decode_responses=True)
