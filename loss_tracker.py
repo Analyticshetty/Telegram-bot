@@ -22,20 +22,14 @@ Storage:
                capped at 500 entries
 """
 
-import os
 import json
 import time
 import logging
 import requests
-import redis
+from redis_client import get_redis
 
 log = logging.getLogger(__name__)
-
-_redis = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://localhost:6379"),
-    decode_responses=True,
-    ssl_cert_reqs=None,
-)
+_redis = get_redis()
 
 K_LOSSES   = "losses:log"
 MAX_LOSSES = 500

@@ -32,11 +32,8 @@ TEXT_MODEL_FALLBACK = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # Redis — persistent memory across redeploys
-_redis = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://localhost:6379"),
-    decode_responses=True,
-    ssl_cert_reqs=None,
-)
+from redis_client import get_redis
+_redis = get_redis()
 MAX_HISTORY = 30  # cap to avoid runaway context
 
 SYSTEM_PROMPT = (

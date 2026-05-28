@@ -11,17 +11,11 @@ Does NOT execute trades. Rule #2 in handover: never wire execution
 until the 12 risk rules are confirmed Y/N by user.
 """
 
-import os
-import redis
 import logging
+from redis_client import get_redis
 
 log = logging.getLogger(__name__)
-
-_redis = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://localhost:6379"),
-    decode_responses=True,
-    ssl_cert_reqs=None,
-)
+_redis = get_redis()
 
 DEFAULT_CAPITAL_USD = 25.0
 GREEN_POSITION_PCT  = 0.15   # 15% of capital

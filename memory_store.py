@@ -11,19 +11,13 @@ All saves are best-effort — never raise to caller, just log and move on.
 A Redis hiccup must not break the bot.
 """
 
-import os
 import json
 import time
 import logging
-import redis
+from redis_client import get_redis
 
 log = logging.getLogger(__name__)
-
-_redis = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://localhost:6379"),
-    decode_responses=True,
-    ssl_cert_reqs=None,
-)
+_redis = get_redis()
 
 # ---------- KEY NAMESPACES ----------
 K_ALERTS         = "mem:alerts"
