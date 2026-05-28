@@ -14,6 +14,8 @@ from scanner import scan as run_scan, format_scan_results
 from smart_wallets import add_wallet, remove_wallet, load_wallets, _all_wallets
 from wallet_discovery import discover_wallets
 import watcher as watcher_module
+import memory_store
+from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
@@ -137,6 +139,21 @@ def run_rug_check_and_remember(message, mint: str):
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
+        # Persist to memory store — survives redeploys, available to /history /lookup
+        try:
+            d = result.get("details") or {}
+            memory_store.save_check(
+                user_id=user_id,
+                mint=mint,
+                symbol=d.get("symbol"),
+                verdict=result.get("verdict"),
+                mc=d.get("market_cap"),
+                liq=d.get("liquidity_usd"),
+                reasons_red=result.get("reasons_red"),
+                reasons_yellow=result.get("reasons_yellow"),
+            )
+        except Exception as e:
+            log.warning(f"save_check failed: {e}")
         # Inject into history so Groq remembers it
         history = ensure_system_prompt(load_history(user_id))
         history.append({"role": "user", "content": f"[Pasted Solana CA] {mint}"})
@@ -192,6 +209,11 @@ def handle_help(message):
         "🔍 `/discoverwallet` — auto-find smart money wallets.\n"
         "👁 `/watcher on/off/status` — narrative alert scanner.\n"
         "💰 `/capital <amount>` — update your capital (used for trade sizing).\n\n"
+        "*Memory (persists across redeploys):*\n"
+        "🚨 `/alerts [keyword]` — last 20 watcher alerts (or search by word)\n"
+        "📋 `/history` — your last 20 /check results\n"
+        "🔎 `/lookup <CA>` — everything bot remembers about a CA\n"
+        "🧠 `/memstats` — memory store size\n\n"
         "_Every GREEN/YELLOW report includes a 💼 Trade Card: entry $, TP1 (2x, sell 50%), TP2 (3x), SL (-30%)._\n\n"
         "_Defensive checks only. Not financial advice._",
         parse_mode="Markdown",
@@ -468,6 +490,129 @@ def handle_capital(message):
         bot.reply_to(message, "❌ Invalid amount. Example: `/capital 50`", parse_mode="Markdown")
 
 
+# ---------- MEMORY COMMANDS (alert / check / scan history) ----------
+
+def _ago(ts: int) -> str:
+    """Human-readable 'X min ago' / 'X h ago' / 'X d ago'."""
+    now = datetime.now(timezone.utc).timestamp()
+    secs = max(0, int(now - (ts or 0)))
+    if secs < 60: return f"{secs}s ago"
+    if secs < 3600: return f"{secs // 60}m ago"
+    if secs < 86400: return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+@bot.message_handler(commands=['alerts'])
+def handle_alerts(message):
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    # Optional needle: /alerts goblin
+    needle = parts[1].strip() if len(parts) > 1 else None
+    if needle:
+        items = memory_store.search_alerts(needle, limit=200)
+        header = f"🔎 *Alerts matching '{needle}'* ({len(items)} found)"
+    else:
+        items = memory_store.get_recent_alerts(limit=20)
+        header = f"🚨 *Last {len(items)} watcher alerts*"
+
+    if not items:
+        bot.reply_to(message, "🚨 No alerts yet. Turn watcher on with `/watcher on`.", parse_mode="Markdown")
+        return
+
+    lines = [header, ""]
+    for a in items[:20]:
+        v_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(a.get("verdict"), "⚪")
+        sym = a.get("symbol") or "?"
+        mint = a.get("mint") or ""
+        mc = a.get("mc") or 0
+        liq = a.get("liq") or 0
+        narr = a.get("narrative") or "?"
+        sw = a.get("smart_wallets") or 0
+        lines.append(
+            f"{v_icon} *{sym}* — \"{narr}\"  _{_ago(a.get('ts'))}_\n"
+            f"   `{mint}`\n"
+            f"   MC ${mc:,.0f} | Liq ${liq:,.0f} | 🐋 {sw}"
+        )
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['history'])
+def handle_history(message):
+    if not owner_only(message):
+        return
+    user_id = message.chat.id
+    items = memory_store.get_recent_checks(user_id, limit=20)
+    if not items:
+        bot.reply_to(message, "📋 No /check history yet. Paste a CA to start.", parse_mode="Markdown")
+        return
+    lines = [f"📋 *Last {len(items)} rug checks*", ""]
+    for c in items:
+        v_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴", "INVALID": "❌"}.get(c.get("verdict"), "⚪")
+        sym = c.get("symbol") or "?"
+        mint = c.get("mint") or ""
+        mc = c.get("mc") or 0
+        liq = c.get("liq") or 0
+        lines.append(
+            f"{v_icon} *{sym}*  _{_ago(c.get('ts'))}_\n"
+            f"   `{mint}`\n"
+            f"   MC ${mc:,.0f} | Liq ${liq:,.0f}"
+        )
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['lookup'])
+def handle_lookup(message):
+    """Look up everything the bot remembers about a CA."""
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: `/lookup <CA>`", parse_mode="Markdown")
+        return
+    ca = parts[1].strip()
+    alert = memory_store.get_alert_by_ca(ca)
+    check = memory_store.get_check_by_ca(ca)
+    if not alert and not check:
+        bot.reply_to(message, f"🔎 Nothing in memory for `{ca[:8]}...`\nRun `/check {ca}` to scan.", parse_mode="Markdown")
+        return
+    lines = [f"🔎 *Memory for `{ca[:8]}...{ca[-4:]}`*", ""]
+    if alert:
+        v_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(alert.get("verdict"), "⚪")
+        lines.append(
+            f"🚨 *Watcher alert* _{_ago(alert.get('ts'))}_\n"
+            f"   {v_icon} {alert.get('symbol')} | \"{alert.get('narrative')}\"\n"
+            f"   MC ${(alert.get('mc') or 0):,.0f} | Liq ${(alert.get('liq') or 0):,.0f} | 🐋 {alert.get('smart_wallets') or 0}"
+        )
+    if check:
+        v_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(check.get("verdict"), "⚪")
+        red = len(check.get("reasons_red") or [])
+        yel = len(check.get("reasons_yellow") or [])
+        lines.append(
+            f"\n📋 *Rug check* _{_ago(check.get('ts'))}_\n"
+            f"   {v_icon} {check.get('symbol')} | {red} red, {yel} yellow flags\n"
+            f"   MC ${(check.get('mc') or 0):,.0f} | Liq ${(check.get('liq') or 0):,.0f}"
+        )
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['memstats'])
+def handle_memstats(message):
+    if not owner_only(message):
+        return
+    s = memory_store.stats()
+    bot.reply_to(
+        message,
+        f"🧠 *Memory store stats*\n\n"
+        f"🚨 Alerts saved: {s['alerts']}\n"
+        f"🔍 Scans saved: {s['scans']}\n"
+        f"📌 Seen narratives (24h TTL): {s['seen_narratives']}\n"
+        f"📌 Seen tokens (24h TTL): {s['seen_tokens']}\n\n"
+        f"Commands: `/alerts [keyword]`, `/history`, `/lookup <CA>`",
+        parse_mode="Markdown",
+    )
+
+
 @bot.message_handler(commands=['scan'])
 def handle_scan(message):
     bot.reply_to(message, "🔍 Scanning Solana new + trending pools… give me 15–30 seconds.")
@@ -479,6 +624,10 @@ def handle_scan(message):
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
+        try:
+            memory_store.save_scan(results_count=len(results), top_results=results)
+        except Exception as e:
+            log.warning(f"save_scan failed: {e}")
     except Exception as e:
         bot.reply_to(message, f"⚠️ Scan failed: {e.__class__.__name__}: {e}")
 

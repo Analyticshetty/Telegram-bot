@@ -22,6 +22,7 @@ from collections import defaultdict
 from rug_check import check_token, format_report
 from smart_wallets import check_wallets_hold_token, load_wallets
 from trade_card import trade_card_for_check
+import memory_store
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +45,9 @@ COMMON_WORDS = {
 # ---------- STATE ----------
 _running        = False
 _thread         = None
-_seen_narratives = set()   # don't re-alert same narrative
-_seen_tokens    = set()    # don't re-alert same token CA
+# Seen sets hydrated from Redis on startup (survives Railway redeploys for 24h)
+_seen_narratives = memory_store.load_seen_narratives()
+_seen_tokens    = memory_store.load_seen_tokens()
 _lock           = threading.Lock()
 _last_scan_time = None
 _last_scan_found = 0       # narratives found in last scan
@@ -242,6 +244,9 @@ def _scan_once(send_alert_fn) -> int:
             with _lock:
                 _seen_narratives.add(narrative)
                 _seen_tokens.add(mint)
+            # Persist seen-state so a Railway redeploy doesn't re-alert this RED
+            memory_store.mark_narrative_seen(narrative)
+            memory_store.mark_token_seen(mint)
             continue
 
         # Build and send alert
@@ -249,9 +254,30 @@ def _scan_once(send_alert_fn) -> int:
         send_alert_fn(alert)
         alerts_sent += 1
 
+        # Persist alert + seen state
+        try:
+            d = rug_result.get("details") or {}
+            holders = check_wallets_hold_token(mint)
+            memory_store.save_alert(
+                narrative=narrative,
+                mint=mint,
+                symbol=token.get("symbol"),
+                verdict=rug_result.get("verdict"),
+                mc=d.get("market_cap") or token.get("mc"),
+                liq=d.get("liquidity_usd"),
+                twitter_ok=twitter_ok,
+                smart_wallets=len(holders),
+                cluster_size=token.get("cluster_size"),
+                full_text=alert,
+            )
+        except Exception as e:
+            log.warning(f"Watcher save_alert failed: {e}")
+
         with _lock:
             _seen_narratives.add(narrative)
             _seen_tokens.add(mint)
+        memory_store.mark_narrative_seen(narrative)
+        memory_store.mark_token_seen(mint)
 
         time.sleep(2)  # brief pause between alerts
 
