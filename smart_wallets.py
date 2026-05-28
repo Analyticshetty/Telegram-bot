@@ -14,67 +14,83 @@ Commands wired in bot.py:
 import json
 import os
 import time
+import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from redis_client import get_redis
 
-def _resolve_wallets_file() -> str:
-    """Pick a writable path. Tries /data (Railway volume) → /app (app dir) → /tmp."""
-    custom = os.environ.get("WALLETS_FILE")
-    if custom:
-        return custom
-    for path in ("/data/smart_wallets.json", "/app/smart_wallets_runtime.json", "/tmp/smart_wallets.json"):
-        try:
-            d = os.path.dirname(path) or "."
-            os.makedirs(d, exist_ok=True)
-            # Probe write
-            test = os.path.join(d, ".write_test")
-            with open(test, "w") as f:
-                f.write("ok")
-            os.remove(test)
-            return path
-        except Exception:
-            continue
-    return "./smart_wallets_runtime.json"
+log = logging.getLogger(__name__)
 
-
-WALLETS_FILE = _resolve_wallets_file()
 SOLANA_RPC   = "https://api.mainnet-beta.solana.com"
 CACHE_TTL    = 300   # seconds — 5 min
 TIMEOUT      = 8
 MAX_WORKERS  = 10    # parallel RPC calls; public RPC rate-limits ~40 req/s
 
 _cache: dict = {}    # {mint: {"ts": float, "holders": list[dict]}}
+_redis = get_redis()
 
-
-# ---------- JSON I/O ----------
-
+WALLETS_REDIS_KEY = "smart_wallets:data"
 SEED_FILE = os.path.join(os.path.dirname(__file__), "smart_wallets.json")
 
-def _read_json() -> dict:
-    try:
-        with open(WALLETS_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # First boot on persistent volume — seed from repo file
+# Legacy file paths used by older deploys — migrated into Redis on first boot if Redis is empty
+LEGACY_FILE_PATHS = (
+    os.environ.get("WALLETS_FILE") or "",
+    "/data/smart_wallets.json",
+    "/app/smart_wallets_runtime.json",
+    "/tmp/smart_wallets.json",
+)
+
+
+def _read_legacy_file() -> dict | None:
+    """Best-effort one-time migration: find an old wallets file and return its contents."""
+    for path in LEGACY_FILE_PATHS:
+        if not path:
+            continue
         try:
-            with open(SEED_FILE, "r") as f:
+            with open(path, "r") as f:
                 data = json.load(f)
-            _write_json(data)
-            return data
-        except Exception:
-            return {"version": "2026-05-25", "wallets": []}
+                if data and data.get("wallets"):
+                    log.info(f"smart_wallets: migrating {len(data['wallets'])} wallets from {path} to Redis")
+                    return data
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            log.warning(f"smart_wallets: legacy read failed for {path}: {e}")
+    # Last resort: repo seed file
+    try:
+        with open(SEED_FILE, "r") as f:
+            return json.load(f)
     except Exception:
-        return {"version": "2026-05-25", "wallets": []}
+        return None
+
+
+def _read_json() -> dict:
+    """Load wallets from Redis. One-time migrate from legacy file if Redis is empty."""
+    try:
+        raw = _redis.get(WALLETS_REDIS_KEY)
+        if raw:
+            return json.loads(raw)
+    except Exception as e:
+        log.warning(f"smart_wallets Redis read failed: {e}")
+
+    # Redis empty — try to migrate from disk
+    legacy = _read_legacy_file()
+    if legacy and legacy.get("wallets"):
+        try:
+            _redis.set(WALLETS_REDIS_KEY, json.dumps(legacy))
+            log.info("smart_wallets: migration to Redis complete")
+        except Exception as e:
+            log.warning(f"smart_wallets: migration write failed: {e}")
+        return legacy
+    return {"version": "2026-05-28", "wallets": []}
 
 
 def _write_json(data: dict):
-    # Ensure parent dir exists (defensive — volume might be missing on a fresh Railway env)
+    """Persist wallets to Redis."""
     try:
-        os.makedirs(os.path.dirname(WALLETS_FILE) or ".", exist_ok=True)
-    except Exception:
-        pass
-    with open(WALLETS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        _redis.set(WALLETS_REDIS_KEY, json.dumps(data))
+    except Exception as e:
+        log.warning(f"smart_wallets Redis write failed: {e}")
 
 
 def _all_wallets() -> list:
