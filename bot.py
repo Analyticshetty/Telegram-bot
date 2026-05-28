@@ -1347,14 +1347,14 @@ def _extract_chart_identity(image_b64: str) -> dict:
 def _looks_like_trade_request(caption: str) -> bool:
     if not caption:
         return False
-    words = {w.strip(".,!?:;").lower() for w in caption.split()}
+    words = {w.strip("/.,!?:;#").lower() for w in caption.split()}
     return bool(words & TRADE_KEYWORDS)
 
 
 def _looks_like_chart_request(caption: str) -> bool:
     if not caption:
         return False
-    words = {w.strip(".,!?:;").lower() for w in caption.split()}
+    words = {w.strip("/.,!?:;#").lower() for w in caption.split()}
     return bool(words & CHART_KEYWORDS)
 
 
