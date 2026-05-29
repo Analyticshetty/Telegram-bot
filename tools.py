@@ -754,417 +754,84 @@ def remove_wallet_action(address: str, caller_user_id=None) -> str:
 
 # ---------- Tool schema for Groq function calling ----------
 
+def _tool(name, desc, params=None, required=None):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {
+                "type": "object",
+                "properties": params or {},
+                "required": required or [],
+            },
+        },
+    }
+
+_INT  = {"type": "integer"}
+_NUM  = {"type": "number"}
+_STR  = {"type": "string"}
+_BOOL = {"type": "boolean"}
+
 TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web for current/real-time information. Use whenever the user "
-                "asks about prices, news, current events, recent token activity, exchange "
-                "status, social mentions, or anything that needs up-to-date info. "
-                "Do NOT use for things you already know from the conversation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query. Be specific and include token names, dates, or context.",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_token_data",
-            "description": (
-                "Get LIVE on-chain data for a specific Solana token: current price, "
-                "market cap, FDV, liquidity, 1h/24h volume, price change. ALWAYS use "
-                "this (NOT web_search) when the user asks about a specific token's "
-                "price, MC, FDV, volume, or liquidity. Note: Bitget app usually "
-                "displays FDV labeled as 'MC' — show both to the user when relevant."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mint": {
-                        "type": "string",
-                        "description": "Solana mint address (base58, 32-44 chars).",
-                    },
-                },
-                "required": ["mint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_watcher_alerts",
-            "description": (
-                "Read the bot's OWN log of past watcher / smart-wallet / narrative alerts. "
-                "Use this whenever the user asks 'what alerts have you sent', 'show me recent "
-                "alerts', 'have we alerted on X', 'what narratives are firing', etc. Do NOT "
-                "fabricate alert lists — if this returns count=0, say so honestly."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit":   {"type": "integer", "description": "How many alerts to return (max 100). Default 20."},
-                    "keyword": {"type": "string",  "description": "Optional case-insensitive filter on narrative/symbol/mint."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_recent_checks",
-            "description": (
-                "Read the bot's history of /check rug-check results that the owner has run. "
-                "Use when the user asks 'what tokens have I checked', 'what was the verdict on X', "
-                "'show me my recent rug checks'. Per-user, scoped to the owner."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "How many checks to return (max 100). Default 20."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_smart_wallet_signals",
-            "description": (
-                "Read recent smart-wallet convergence/accumulation signals — the 2+-wallets-in-same-CA "
-                "events from the smart wallet feed (swfeed). Use when the user asks 'which tokens "
-                "have multiple smart wallets bought', 'what swfeed signals fired today', 'any "
-                "convergence on X'. DIFFERENT from get_watcher_alerts (those are narrative clusters)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "How many signals to return (max 100). Default 20."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_positions",
-            "description": (
-                "Read the owner's positions tracked by the bot. status='open' returns currently "
-                "open positions with live P&L; status='closed' returns the last 20 closed positions "
-                "with realized P&L. Use whenever the user asks about 'my positions', 'what am I "
-                "holding', 'last trades', 'P&L', 'closed trades'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {"type": "string", "enum": ["open", "closed"], "description": "Default 'open'."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_watcher_status",
-            "description": (
-                "Get current run state of all background modules: watcher (narrative scanner), "
-                "swfeed (smart-wallet feed), devfeed (dev-sell tracker), sleep mode, position "
-                "tracker. Use when the user asks 'is the watcher running', 'what's the bot doing', "
-                "'is swfeed on', 'am I in sleep mode'."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_capital",
-            "description": "Current trading capital in USD from Redis state. Use whenever the user asks 'what's my capital', 'how much do I have', 'what am I working with'.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_losses",
-            "description": "Recent realized losses with Fib/volume REAL_LOSS vs UNCONFIRMED classification. Use for 'what losses have I taken', 'show me my recent losses', 'how bad was X loss'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many losses (max 100). Default 20."}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_stats",
-            "description": "Aggregate trading stats: position win rate, total P&L, watcher accuracy, check breakdown, narrative ROI. Use for 'what's my win rate', 'how am I doing', 'overall P&L', 'best narratives'.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_memories",
-            "description": "Read permanent /remember facts the owner has set. Use for 'what rules do I have', 'what memories are saved', 'what did I tell you to remember'.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_smart_wallets",
-            "description": "List tracked smart wallets (paginated, 204 total). Use for 'show me the wallets I track', 'how many wallets are on the list', 'is wallet X tracked'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "page":      {"type": "integer", "description": "1-indexed page. Default 1."},
-                    "page_size": {"type": "integer", "description": "Wallets per page (max 100). Default 50."},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_recent_scans",
-            "description": "Recent /scan results from memory. Use for 'what did the last scan find', 'show me recent scans'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many scans (max 50). Default 10."}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_signal_log",
-            "description": "Recent /signal score+lean predictions with their 6h-horizon outcome (if resolved). Use for 'what signals have we run', 'how did the signal on X turn out', 'recent predictions'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many signals (max 100). Default 20."}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_signal_accuracy",
-            "description": "Overall self-tracked hit rate of /signal predictions at the 6h horizon, broken down by lean (BULLISH/NEUTRAL/BEARISH). Use for 'how accurate are the signals', 'should I trust /signal'.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_lookup",
-            "description": "Pull EVERYTHING the bot remembers about a Solana CA in one shot: last rug check, last watcher alert, all smart-wallet signals on it, open/closed positions, losses. Use whenever the user names a CA and wants the full picture.",
-            "parameters": {
-                "type": "object",
-                "properties": {"mint": {"type": "string", "description": "Solana mint address."}},
-                "required": ["mint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_rug_check",
-            "description": "Trigger the 9-engine rug check on a CA — same as /check. Returns verdict + reasons + details. Use when user pastes a CA and asks 'check this' or 'is this safe'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"mint": {"type": "string"}},
-                "required": ["mint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_scan",
-            "description": "Trigger /scan — top Solana candidates from GeckoTerminal new+trending. Use for 'find me something to buy', 'what's hot', 'scan for opportunities'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many candidates (max 10). Default 5."}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_position",
-            "description": "Open a tracked position on a CA — same as /buy. Owner-only. Use when user says 'buy X', 'I just bought X', 'track a $5 position on X'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mint":        {"type": "string"},
-                    "size_usd":    {"type": "number", "description": "USD size. Defaults to 15% of capital."},
-                    "entry_price": {"type": "number", "description": "Manual entry price. Defaults to current live price."},
-                },
-                "required": ["mint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "close_position",
-            "description": "Close a tracked position by CA — same as /sell. Owner-only. Use when user says 'close X', 'sell X', 'I sold X off-bot, close it in the tracker'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"mint": {"type": "string"}},
-                "required": ["mint"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_capital",
-            "description": "Update the tracked capital in USD — same as /capital <amount>. Owner-only. Use when user says 'I topped up to $X', 'set capital to X'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"amount_usd": {"type": "number"}},
-                "required": ["amount_usd"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_memory",
-            "description": "Save a permanent rule/fact for the bot to remember — same as /remember. Owner-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "forget_memory",
-            "description": "Delete a memory by exact text match — same as /forget. Owner-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "toggle_sleep",
-            "description": "Turn sleep mode on or off — same as /sleep. Owner-only. Use for 'go to sleep', 'wake up', 'silence alerts'.",
-            "parameters": {
-                "type": "object",
-                "properties": {"on": {"type": "boolean"}},
-                "required": ["on"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "toggle_watcher",
-            "description": "Stop watcher (on=False). Starting watcher should be done via /watcher on from Telegram (chat-brain start lacks alert handler).",
-            "parameters": {
-                "type": "object",
-                "properties": {"on": {"type": "boolean"}},
-                "required": ["on"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "toggle_swfeed",
-            "description": "Stop smart-wallet feed (on=False). Start via /swfeed on from Telegram.",
-            "parameters": {
-                "type": "object",
-                "properties": {"on": {"type": "boolean"}},
-                "required": ["on"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "toggle_devfeed",
-            "description": "Stop dev-sell tracker (on=False). Start via /devfeed on from Telegram.",
-            "parameters": {
-                "type": "object",
-                "properties": {"on": {"type": "boolean"}},
-                "required": ["on"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_wallet",
-            "description": "Add a wallet to the smart-wallet tracking list — same as /addwallet. Owner-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "address": {"type": "string"},
-                    "label":   {"type": "string"},
-                },
-                "required": ["address", "label"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remove_wallet",
-            "description": "Remove a wallet from the tracking list — same as /removewallet. Owner-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {"address": {"type": "string"}},
-                "required": ["address"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": (
-                "Fetch the main readable content of a specific URL. Use when the user "
-                "gives you a link or when web_search returned a promising URL you need "
-                "to read fully."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Full URL including https://"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
+    # External data
+    _tool("web_search", "Search the web for news/prices of non-Solana things.",
+          {"query": _STR}, ["query"]),
+    _tool("get_token_data", "Live DEXScreener data for a Solana mint.",
+          {"mint": _STR}, ["mint"]),
+    _tool("fetch_url", "Read a specific URL.", {"url": _STR}, ["url"]),
+
+    # State readers
+    _tool("get_watcher_alerts", "Past narrative-cluster alerts from /watcher.",
+          {"limit": _INT, "keyword": _STR}),
+    _tool("get_recent_checks", "Owner's recent /check rug-check history.",
+          {"limit": _INT}),
+    _tool("get_smart_wallet_signals", "Past 2+-wallet convergence signals from /swfeed.",
+          {"limit": _INT}),
+    _tool("get_positions", "Tracked positions. status='open' (live P&L) or 'closed'.",
+          {"status": {"type": "string", "enum": ["open", "closed"]}}),
+    _tool("get_watcher_status", "Run state of watcher, swfeed, devfeed, sleep, position tracker."),
+    _tool("get_capital", "Current trading capital in USD."),
+    _tool("get_losses", "Realized losses with REAL/UNCONFIRMED classification.",
+          {"limit": _INT}),
+    _tool("get_stats", "Aggregate trading stats: win rate, P&L, narrative ROI."),
+    _tool("get_memories", "Permanent /remember facts saved by the owner."),
+    _tool("get_smart_wallets", "Paginated list of the 204 tracked smart wallets.",
+          {"page": _INT, "page_size": _INT}),
+    _tool("get_recent_scans", "Past /scan results.", {"limit": _INT}),
+    _tool("get_signal_log", "Past /signal predictions with 6h outcomes.", {"limit": _INT}),
+    _tool("get_signal_accuracy", "Self-tracked hit rate of /signal predictions."),
+    _tool("get_lookup", "EVERYTHING the bot knows about a CA in one shot (use for any 'what about <CA>' question).",
+          {"mint": _STR}, ["mint"]),
+
+    # On-demand reruns
+    _tool("run_rug_check", "Trigger the 9-engine rug check on a CA (same as /check).",
+          {"mint": _STR}, ["mint"]),
+    _tool("run_scan", "Trigger /scan — top Solana candidates.", {"limit": _INT}),
+
+    # Actions (owner-only; non-owner gets REFUSED back)
+    _tool("open_position", "Open a tracked position (same as /buy). Owner-only.",
+          {"mint": _STR, "size_usd": _NUM, "entry_price": _NUM}, ["mint"]),
+    _tool("close_position", "Close a tracked position (same as /sell). Owner-only.",
+          {"mint": _STR}, ["mint"]),
+    _tool("set_capital", "Update tracked capital (same as /capital). Owner-only.",
+          {"amount_usd": _NUM}, ["amount_usd"]),
+    _tool("add_memory", "Save a permanent fact (same as /remember). Owner-only.",
+          {"text": _STR}, ["text"]),
+    _tool("forget_memory", "Delete a memory by exact text (same as /forget). Owner-only.",
+          {"text": _STR}, ["text"]),
+    _tool("toggle_sleep", "Turn sleep mode on/off. Owner-only.",
+          {"on": _BOOL}, ["on"]),
+    _tool("toggle_watcher", "Stop watcher (start blocked from chat). Owner-only.",
+          {"on": _BOOL}, ["on"]),
+    _tool("toggle_swfeed", "Stop swfeed (start blocked from chat). Owner-only.",
+          {"on": _BOOL}, ["on"]),
+    _tool("toggle_devfeed", "Stop devfeed (start blocked from chat). Owner-only.",
+          {"on": _BOOL}, ["on"]),
+    _tool("add_wallet", "Add a wallet to tracking (same as /addwallet). Owner-only.",
+          {"address": _STR, "label": _STR}, ["address", "label"]),
+    _tool("remove_wallet", "Remove a wallet from tracking (same as /removewallet). Owner-only.",
+          {"address": _STR}, ["address"]),
 ]
 
 

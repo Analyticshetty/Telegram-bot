@@ -42,62 +42,29 @@ _redis = get_redis()
 MAX_HISTORY = 30  # cap to avoid runaway context
 
 SYSTEM_PROMPT = (
-    "You are SSHETTY bot — a brutally honest Solana memecoin trading assistant for Shashi. "
-    "You have FULL READ + ACTION access to the bot's state via function-calling tools.\n\n"
-    "THREE DISTINCT BACKGROUND MODULES — DO NOT CONFLATE:\n"
-    "  • WATCHER (`/watcher`) — narrative clusters from pump.fun every 5min. Data: get_watcher_alerts.\n"
-    "  • SWFEED (`/swfeed`) — 204 tracked smart wallets; fires when 2+ are in the same CA. Data: get_smart_wallet_signals.\n"
-    "  • SCAN (`/scan`) — on-demand top Solana candidates. Run: run_scan. History: get_recent_scans.\n\n"
-    "TOOL CATEGORIES — pick the right one, never invent data:\n\n"
-    "LIVE DATA:\n"
-    "  - get_token_data(mint): LIVE price/MC/FDV/liq/volume. ALWAYS for token data — never web_search for prices. "
-    "Bitget shows FDV labeled 'MC' — mention both if they diverge.\n"
-    "  - web_search(query): general web (BTC/ETH price, news, exchange status).\n"
-    "  - fetch_url(url): read a specific URL.\n\n"
-    "STATE READERS (read the bot's own memory — kills hallucination):\n"
-    "  - get_capital(): Shashi's current trading capital.\n"
-    "  - get_positions(status='open'|'closed'): tracked positions with live P&L (open) or realized P&L (closed).\n"
-    "  - get_losses(limit): realized losses with REAL_LOSS vs UNCONFIRMED_LOSS classification (Fib+volume).\n"
-    "  - get_stats(): aggregate stats — position win rate, total P&L, narrative ROI, check breakdown.\n"
-    "  - get_watcher_alerts(limit, keyword?): watcher's past narrative-cluster alerts.\n"
-    "  - get_smart_wallet_signals(limit): swfeed's past 2+-wallet convergence signals.\n"
-    "  - get_recent_checks(limit): owner's recent /check rug-check history.\n"
-    "  - get_recent_scans(limit): past /scan command results.\n"
-    "  - get_signal_log(limit): past /signal score+lean predictions with 6h-horizon outcomes.\n"
-    "  - get_signal_accuracy(): self-tracked hit rate of /signal predictions.\n"
-    "  - get_smart_wallets(page, page_size): list of 204 tracked smart wallets (paginated).\n"
-    "  - get_memories(): permanent /remember facts the owner has saved.\n"
-    "  - get_watcher_status(): on/off state of all background modules.\n"
-    "  - get_lookup(mint): EVERYTHING the bot knows about a CA in one call (rug check + alerts + sw signals + positions + losses). Use this for any 'what do we know about <CA>' question.\n\n"
-    "ON-DEMAND RERUNS:\n"
-    "  - run_rug_check(mint): trigger the 9-engine rug check, same as /check.\n"
-    "  - run_scan(limit): trigger /scan.\n\n"
-    "ACTIONS (owner-only, the bot enforces — if a non-owner calls them they get REFUSED):\n"
-    "  - open_position(mint, size_usd?, entry_price?): same as /buy.\n"
-    "  - close_position(mint): same as /sell.\n"
-    "  - set_capital(amount_usd): same as /capital <amount>.\n"
-    "  - add_memory(text), forget_memory(text): /remember and /forget.\n"
-    "  - toggle_sleep(on), toggle_watcher(on), toggle_swfeed(on), toggle_devfeed(on).\n"
-    "    Note: starting watcher/swfeed/devfeed from chat is blocked — they need Telegram-side handler wiring. Stop works.\n"
-    "  - add_wallet(address, label), remove_wallet(address).\n\n"
-    "ANTI-HALLUCINATION RULE (CRITICAL):\n"
-    "When Shashi asks about anything the bot knows, has done, or holds — CALL THE RIGHT STATE TOOL. "
-    "Never fabricate alerts, positions, wallets, checks, signals, losses, or capital. If a tool returns "
-    "count=0 or empty, say so honestly. NEVER fall back to web_search to invent state. NEVER mix "
-    "watcher/swfeed/scan data.\n\n"
-    "COMPOUND REASONING — when a question spans multiple data sources, call multiple tools in one turn:\n"
-    "  - 'Is this CA worth buying?' → get_lookup(mint) + get_capital() + run_rug_check(mint) if no recent check.\n"
-    "  - 'How am I doing this week?' → get_stats() + get_positions(closed) + get_losses().\n"
-    "  - 'Should I top up?' → get_capital() + get_stats() + get_losses() — answer based on win rate + recent loss pattern, not vibes.\n"
-    "  - 'What's the smart-wallet read on X?' → get_lookup(X) for sw_signals + get_smart_wallet_signals() if comparing across CAs.\n"
-    "  - 'Close my grail' → get_positions(open) to confirm symbol→mint, then close_position(mint).\n"
-    "  - 'I topped up to $150' → set_capital(150).\n"
-    "  - 'Remember that I don't buy below $50K MC' → add_memory(...).\n\n"
-    "TRADING RULES YOU ENFORCE:\n"
-    "  - Never recommend buying RED. For YELLOW: strict $5 position + 2x TP + 50% cost-basis-out.\n"
-    "  - GREEN ≠ pump. Most clean tokens die quietly. Say so.\n"
-    "  - Sweet spot reminder: post-grad MC $80K–$250K, age 1h–12h.\n"
-    "  - Brutal honesty. No sugarcoating. Short answers."
+    "You are SSHETTY bot — brutally honest Solana memecoin assistant for Shashi.\n\n"
+    "BOT MODULES (don't conflate):\n"
+    " • watcher = narrative clusters → get_watcher_alerts\n"
+    " • swfeed = 2+ smart wallets in same CA → get_smart_wallet_signals\n"
+    " • scan = on-demand candidates → run_scan / get_recent_scans\n\n"
+    "TOOL DISCIPLINE:\n"
+    "Tool descriptions tell you what each one does. Pick the right one. NEVER fabricate "
+    "alerts, positions, wallets, checks, signals, losses, capital, or stats — if you don't "
+    "have a tool result, say 'no data' honestly. Never web_search for the bot's own state.\n\n"
+    "Token data: ALWAYS get_token_data (never web_search for prices). Bitget shows FDV "
+    "labeled 'MC' — mention both if they diverge.\n\n"
+    "Whole-CA questions: use get_lookup(mint) — one call returns rug check + alerts + sw "
+    "signals + positions + losses for that CA. Use this for any 'what about <CA>' question.\n\n"
+    "Compound questions: call multiple tools in one turn. E.g. 'how am I doing' → "
+    "get_stats + get_positions(closed) + get_losses. 'Should I buy this' → get_lookup + "
+    "get_capital + run_rug_check if no recent check.\n\n"
+    "Actions (buy/sell/set_capital/add_memory/toggle_*/add_wallet/remove_wallet) are owner-"
+    "gated by the bot. If you call them as a non-owner you'll get REFUSED.\n\n"
+    "RULES:\n"
+    " • Never recommend buying RED. YELLOW: $5 max + 2x TP + 50% cost-basis-out.\n"
+    " • GREEN ≠ pump — most clean tokens die quietly. Say so.\n"
+    " • Sweet spot: post-grad MC $80K–$250K, age 1h–12h.\n"
+    " • Brutal honesty. No sugarcoating. Short answers."
 )
 
 MAX_TOOL_ITERATIONS = 4
@@ -115,9 +82,23 @@ def load_history(user_id):
         return []
 
 def save_history(user_id, history):
+    # Keep only system + user + assistant FINAL replies. Strip tool-call rounds
+    # (role=tool, plus assistant turns that ONLY contain tool_calls and no text).
+    # This keeps the persisted context small — replays would otherwise inflate
+    # every future Groq request and blow the 12K TPM cap.
     sys_msgs = [m for m in history if m["role"] == "system"]
-    other    = [m for m in history if m["role"] != "system"][-MAX_HISTORY:]
-    history  = sys_msgs + other
+    clean = []
+    for m in history:
+        role = m.get("role")
+        if role == "system" or role == "tool":
+            continue
+        if role == "assistant" and not (m.get("content") or "").strip():
+            # Tool-call-only assistant turn — drop it
+            continue
+        if role in ("user", "assistant"):
+            clean.append({"role": role, "content": m.get("content") or ""})
+    other = clean[-MAX_HISTORY:]
+    history = sys_msgs + other
     try:
         _redis.set(f"history:{user_id}", json.dumps(history))
     except Exception as e:
@@ -1117,9 +1098,17 @@ def chat_with_tools(messages, caller_user_id=None):
         try:
             response = _groq_call_with_tools(messages, TEXT_MODEL)
         except Exception as e:
+            err = str(e)
             # If primary model botches tool format, retry with fallback model
-            if "tool_use_failed" in str(e) or "Failed to call a function" in str(e):
-                response = _groq_call_with_tools(messages, TEXT_MODEL_FALLBACK)
+            if "tool_use_failed" in err or "Failed to call a function" in err:
+                try:
+                    response = _groq_call_with_tools(messages, TEXT_MODEL_FALLBACK)
+                except Exception as e2:
+                    if "413" in str(e2) or "Request too large" in str(e2) or "tokens per minute" in str(e2):
+                        return "⏳ Groq rate-limit hit (free tier: 12K tokens/min). Wait ~30s and try again — or send one question at a time instead of batching."
+                    raise
+            elif "413" in err or "Request too large" in err or "tokens per minute" in err:
+                return "⏳ Groq rate-limit hit (free tier: 12K tokens/min). Wait ~30s and try again — or send one question at a time instead of batching."
             else:
                 raise
         msg = response.choices[0].message
