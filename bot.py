@@ -39,7 +39,17 @@ VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Redis — persistent memory across redeploys
 from redis_client import get_redis
 _redis = get_redis()
-MAX_HISTORY = 30  # cap to avoid runaway context
+MAX_HISTORY        = 30   # how many user+assistant turns to PERSIST
+MAX_HISTORY_TO_LLM = 10   # how many turns to actually SEND to Groq per request (keeps TPM low)
+
+# Per-user message pacing — Groq free tier is 12K TPM. Each chat request runs
+# ~2-4K tokens, so we pace messages from the SAME user to ~1 every 5s so an
+# 8-message batch fits cleanly inside one minute. Different users don't block
+# each other.
+_user_locks      = {}   # user_id -> threading.Lock
+_user_last_sent  = {}   # user_id -> last completion ts
+_user_locks_guard = threading.Lock()
+PACE_SECONDS_PER_USER = 5
 
 SYSTEM_PROMPT = (
     "You are SSHETTY bot — brutally honest Solana memecoin assistant for Shashi.\n\n"
@@ -140,6 +150,38 @@ def memories_as_context() -> str:
         return ""
     lines = "\n".join(f"- {m}" for m in memories)
     return f"\n\nShashi's permanent rules & facts (always apply these):\n{lines}"
+
+def _get_user_lock(user_id):
+    with _user_locks_guard:
+        if user_id not in _user_locks:
+            _user_locks[user_id] = threading.Lock()
+        return _user_locks[user_id]
+
+
+def _pace_user(user_id):
+    """Block until this user's TPM budget is free. Caller must hold the user lock."""
+    last = _user_last_sent.get(user_id, 0.0)
+    delta = time.time() - last
+    if delta < PACE_SECONDS_PER_USER:
+        time.sleep(PACE_SECONDS_PER_USER - delta)
+
+
+def _mark_user_sent(user_id):
+    _user_last_sent[user_id] = time.time()
+
+
+def _trim_history_for_request(history):
+    """Send only the last MAX_HISTORY_TO_LLM user+assistant turns to Groq.
+    System message and trailing user turn are preserved. Keeps TPM low without
+    breaking conversation context."""
+    if len(history) <= 2:
+        return history
+    sys_msgs = [m for m in history if m.get("role") == "system"]
+    other    = [m for m in history if m.get("role") != "system"]
+    if len(other) <= MAX_HISTORY_TO_LLM:
+        return sys_msgs + other
+    return sys_msgs + other[-MAX_HISTORY_TO_LLM:]
+
 
 def ensure_system_prompt(history):
     full_prompt = SYSTEM_PROMPT + memories_as_context()
@@ -1070,15 +1112,22 @@ def handle_message(message):
         run_rug_check_and_remember(message, user_text)
         return
 
-    history = ensure_system_prompt(load_history(user_id))
-    history.append({"role": "user", "content": user_text})
-    try:
-        reply = chat_with_tools(history, caller_user_id=user_id)
-    except Exception as e:
-        reply = f"⚠️ Error: {e.__class__.__name__}: {str(e)[:300]}"
-    history.append({"role": "assistant", "content": reply})
-    save_history(user_id, history)
-    bot.reply_to(message, reply)
+    # Per-user lock + pacing — when Shashi batches messages, they serialize
+    # through this lock and we sleep enough between each so they fit cleanly
+    # inside the 12K TPM window. Different users don't block each other.
+    lock = _get_user_lock(user_id)
+    with lock:
+        _pace_user(user_id)
+        history = ensure_system_prompt(load_history(user_id))
+        history.append({"role": "user", "content": user_text})
+        try:
+            reply = chat_with_tools(history, caller_user_id=user_id)
+        except Exception as e:
+            reply = f"⚠️ Error: {e.__class__.__name__}: {str(e)[:300]}"
+        history.append({"role": "assistant", "content": reply})
+        save_history(user_id, history)
+        _mark_user_sent(user_id)
+        bot.reply_to(message, reply)
 
 
 def _groq_call_with_tools(messages, model):
@@ -1091,32 +1140,69 @@ def _groq_call_with_tools(messages, model):
     )
 
 
-def chat_with_tools(messages, caller_user_id=None):
-    """Groq chat loop with function-calling. Runs tools when Groq requests them.
-    caller_user_id is threaded through to execute_tool so action tools can owner-gate."""
-    for _ in range(MAX_TOOL_ITERATIONS):
+def _is_tpm_error(err_str: str) -> bool:
+    return any(x in err_str for x in ("413", "Request too large", "tokens per minute",
+                                       "rate_limit_exceeded", "TPM"))
+
+
+def _extract_wait_seconds(err_str: str, default: float = 8.0) -> float:
+    """Groq's error often includes 'please try again in X.XXs'. Pull it out."""
+    import re
+    m = re.search(r"try again in\s+([\d.]+)s", err_str, re.IGNORECASE)
+    if m:
         try:
-            response = _groq_call_with_tools(messages, TEXT_MODEL)
+            return min(float(m.group(1)) + 1.0, 45.0)  # cap at 45s
+        except Exception:
+            pass
+    return default
+
+
+def _groq_call_safe(messages, model, max_retries: int = 3):
+    """Wrapper that backs off on TPM errors instead of failing. Returns response or raises."""
+    for attempt in range(max_retries):
+        try:
+            return _groq_call_with_tools(messages, model)
         except Exception as e:
             err = str(e)
-            # If primary model botches tool format, retry with fallback model
+            if _is_tpm_error(err) and attempt < max_retries - 1:
+                wait = _extract_wait_seconds(err, default=8.0 * (attempt + 1))
+                log.warning(f"TPM hit on {model}, sleeping {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            raise
+
+
+def chat_with_tools(messages, caller_user_id=None):
+    """Groq chat loop with function-calling. Runs tools when Groq requests them.
+    caller_user_id is threaded through to execute_tool so action tools can owner-gate.
+    Sends only the trimmed-for-LLM history per call to keep TPM low; full history is
+    persisted separately by the caller."""
+    sent_messages = _trim_history_for_request(messages)
+    # Mirror tool exchanges added during this turn into the live messages list
+    # (we mutate sent_messages directly so OpenAI tool-call protocol stays intact)
+    for _ in range(MAX_TOOL_ITERATIONS):
+        try:
+            response = _groq_call_safe(sent_messages, TEXT_MODEL)
+        except Exception as e:
+            err = str(e)
             if "tool_use_failed" in err or "Failed to call a function" in err:
                 try:
-                    response = _groq_call_with_tools(messages, TEXT_MODEL_FALLBACK)
+                    response = _groq_call_safe(sent_messages, TEXT_MODEL_FALLBACK)
                 except Exception as e2:
-                    if "413" in str(e2) or "Request too large" in str(e2) or "tokens per minute" in str(e2):
-                        return "⏳ Groq rate-limit hit (free tier: 12K tokens/min). Wait ~30s and try again — or send one question at a time instead of batching."
+                    if _is_tpm_error(str(e2)):
+                        return "⏳ Groq rate-limit hit. The bot retried with backoff and still couldn't fit. Send messages one at a time or wait ~60s."
                     raise
-            elif "413" in err or "Request too large" in err or "tokens per minute" in err:
-                return "⏳ Groq rate-limit hit (free tier: 12K tokens/min). Wait ~30s and try again — or send one question at a time instead of batching."
+            elif _is_tpm_error(err):
+                return "⏳ Groq rate-limit hit. The bot retried with backoff and still couldn't fit. Send messages one at a time or wait ~60s."
             else:
                 raise
         msg = response.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             return msg.content or "(empty response)"
-        # Record the assistant's tool-call turn
-        messages.append({
+        # Record the assistant's tool-call turn (sent_messages only — not the
+        # persisted history; save_history will strip tool exchanges anyway).
+        sent_messages.append({
             "role": "assistant",
             "content": msg.content or "",
             "tool_calls": [
@@ -1135,7 +1221,7 @@ def chat_with_tools(messages, caller_user_id=None):
             except Exception:
                 args = {}
             result = execute_tool(tc.function.name, args, caller_user_id=caller_user_id)
-            messages.append({
+            sent_messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": result[:6000],
