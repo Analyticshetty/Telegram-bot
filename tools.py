@@ -368,21 +368,36 @@ def get_memories() -> str:
         return f"get_memories error: {e.__class__.__name__}: {e}"
 
 
-def get_smart_wallets(page: int = 1, page_size: int = 50) -> str:
-    """List tracked smart wallets (204 total). Paginated to avoid blowing context."""
+def get_smart_wallets(page: int = 1, page_size: int = 25) -> str:
+    """List tracked smart wallets. Returns total count + a sample of labels so
+    the LLM doesn't get overwhelmed and falsely report 'none'."""
     try:
         import smart_wallets
         page = max(1, int(page or 1))
-        page_size = max(1, min(int(page_size or 50), 100))
+        page_size = max(1, min(int(page_size or 25), 50))
         all_w = smart_wallets.load_wallets()
         total = len(all_w)
         start = (page - 1) * page_size
         chunk = all_w[start:start + page_size]
-        out = [{"address": w.get("address"), "label": w.get("label"),
-                "source": w.get("source")} for w in chunk]
+        labels_sample = [w.get("label") for w in chunk if w.get("label")]
+        out = [{"address": (w.get("address") or "")[:10] + "...",
+                "label":   w.get("label"),
+                "source":  w.get("source")} for w in chunk]
+        summary = (
+            f"{total} smart wallets tracked total. "
+            f"Page {page} (size {page_size}) returns {len(out)} entries."
+            if total > 0
+            else "Wallet list is EMPTY. Either Redis was wiped or smart_wallets:data is missing. "
+                 "Tell Shashi to run /listwallets to confirm, and /discoverwallet to rebuild if so."
+        )
         return json.dumps({
-            "total": total, "page": page, "page_size": page_size,
-            "returned": len(out), "wallets": out
+            "summary":       summary,
+            "total":         total,
+            "page":          page,
+            "page_size":     page_size,
+            "returned":      len(out),
+            "labels_sample": labels_sample,
+            "wallets":       out,
         })
     except Exception as e:
         return f"get_smart_wallets error: {e.__class__.__name__}: {e}"
@@ -452,8 +467,8 @@ def get_signal_accuracy() -> str:
 
 
 def get_lookup(mint: str) -> str:
-    """Pull everything the bot remembers about a CA: rug check, watcher alerts,
-    smart-wallet signals, positions, losses on this token. The full picture in one tool."""
+    """Pull everything the bot remembers about a CA. Pre-formats timestamps and
+    trims raw fields so the LLM can't fabricate metrics from raw dumps."""
     try:
         import memory_store
         import smart_wallet_feed
@@ -464,44 +479,110 @@ def get_lookup(mint: str) -> str:
             return json.dumps({"error": "no mint provided"})
         out = {"mint": mint}
 
-        # Most recent rug check
+        # Most recent rug check — keep only safe-to-summarize fields
         try:
-            out["last_check"] = memory_store.get_check_by_ca(mint)
+            chk = memory_store.get_check_by_ca(mint)
+            if chk:
+                out["last_check"] = {
+                    "ago":          _ago_str(chk.get("ts")),
+                    "symbol":       chk.get("symbol"),
+                    "verdict":      chk.get("verdict"),
+                    "market_cap":   chk.get("mc"),
+                    "liquidity":    chk.get("liq"),
+                    "red_flags":    chk.get("reasons_red") or [],
+                    "yellow_flags": chk.get("reasons_yellow") or [],
+                }
+            else:
+                out["last_check"] = None
         except Exception:
             out["last_check"] = None
 
         # Most recent watcher alert
         try:
-            out["last_alert"] = memory_store.get_alert_by_ca(mint)
+            al = memory_store.get_alert_by_ca(mint)
+            if al:
+                out["last_alert"] = {
+                    "ago":           _ago_str(al.get("ts")),
+                    "narrative":     al.get("narrative"),
+                    "symbol":        al.get("symbol"),
+                    "verdict":       al.get("verdict"),
+                    "market_cap":    al.get("mc"),
+                    "liquidity":     al.get("liq"),
+                    "smart_wallets": al.get("smart_wallets"),
+                    "cluster_size":  al.get("cluster_size"),
+                }
+            else:
+                out["last_alert"] = None
         except Exception:
             out["last_alert"] = None
 
-        # All smart-wallet signal events for this CA
+        # Smart-wallet signal events for this CA
         try:
             all_sigs = smart_wallet_feed.get_recent_signals(limit=200)
-            out["sw_signals"] = [s for s in all_sigs if s.get("mint") == mint]
+            matching = [s for s in all_sigs if s.get("mint") == mint]
+            out["sw_signals_count"] = len(matching)
+            out["sw_signals"] = [{
+                "ago":          _ago_str(s.get("ts")),
+                "wallet_count": s.get("wallet_count"),
+                "wallets":      s.get("wallet_labels") or [],
+                "verdict":      s.get("verdict"),
+            } for s in matching[:5]]
         except Exception:
             out["sw_signals"] = []
+            out["sw_signals_count"] = 0
 
-        # Open position?
+        # Open position with live P&L
         try:
-            out["open_position"] = position_tracker.get_position(mint)
+            op = position_tracker.get_position(mint)
+            if op:
+                live = position_tracker.get_live_price(mint) or op.get("entry_price")
+                pnl_pct = ((live / op["entry_price"]) - 1) * 100 if op.get("entry_price") else 0
+                out["open_position"] = {
+                    "ago":         _ago_str(op.get("opened_at")),
+                    "symbol":      op.get("symbol"),
+                    "size_usd":    op.get("size_usd"),
+                    "entry_price": op.get("entry_price"),
+                    "live_price":  live,
+                    "live_pnl_pct": round(pnl_pct, 1),
+                }
+            else:
+                out["open_position"] = None
         except Exception:
             out["open_position"] = None
 
-        # Closed positions on this CA?
+        # Closed positions on this CA
         try:
             closed = position_tracker.list_closed(limit=50)
-            out["closed_positions"] = [p for p in closed if p.get("mint") == mint]
+            matching_c = [p for p in closed if p.get("mint") == mint]
+            out["closed_positions"] = [{
+                "ago":          _ago_str(p.get("closed_at")),
+                "symbol":       p.get("symbol"),
+                "size_usd":     p.get("size_usd"),
+                "pnl_usd":      p.get("pnl_usd"),
+                "pnl_pct":      p.get("pnl_pct"),
+                "close_reason": p.get("close_reason"),
+            } for p in matching_c]
         except Exception:
             out["closed_positions"] = []
 
-        # Loss log entries for this CA?
+        # Loss log entries for this CA
         try:
             losses = loss_tracker.get_recent_losses(limit=100)
-            out["losses"] = [l for l in losses if l.get("mint") == mint]
+            matching_l = [l for l in losses if l.get("mint") == mint]
+            out["losses"] = [{
+                "ago":            _ago_str(l.get("ts")),
+                "classification": l.get("classification"),
+                "pnl_usd":        l.get("pnl_usd"),
+                "pnl_pct":        l.get("pnl_pct"),
+            } for l in matching_l]
         except Exception:
             out["losses"] = []
+
+        out["summary_hint"] = (
+            "Use ONLY the fields present in this JSON. Do NOT invent risk-percentage, "
+            "score, or rating fields — they're not in this data. Format timestamps "
+            "using the 'ago' field, never raw numbers."
+        )
 
         return json.dumps(out, default=str)
     except Exception as e:

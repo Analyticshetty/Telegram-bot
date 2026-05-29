@@ -226,6 +226,25 @@ def close_position(mint: str, reason: str = "manual", exit_price: float = None) 
     except Exception as e:
         log.warning(f"loss_tracker evaluation failed: {e}")
 
+    # Auto-adjust capital by realized P&L (treats state:capital_usd as
+    # "total wealth" — on close, wealth shifts by pnl_usd. Open positions
+    # don't touch capital since the money is just locked in tokens.)
+    try:
+        pnl = target.get("pnl_usd", 0)
+        if pnl:
+            raw = _redis.get("state:capital_usd")
+            try:
+                cap = float(raw) if raw else 25.0
+            except (TypeError, ValueError):
+                cap = 25.0
+            new_cap = max(0.0, round(cap + float(pnl), 2))
+            _redis.set("state:capital_usd", str(new_cap))
+            target["capital_before"] = round(cap, 2)
+            target["capital_after"]  = new_cap
+            log.info(f"capital auto-adjusted: ${cap:.2f} -> ${new_cap:.2f} (pnl ${pnl:+.2f})")
+    except Exception as e:
+        log.warning(f"capital auto-adjust failed: {e}")
+
     return {"ok": True, "position": target}
 
 
