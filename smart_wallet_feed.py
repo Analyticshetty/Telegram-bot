@@ -14,6 +14,7 @@ Architecture (designed for $0/mo on free tiers):
 Storage (Redis):
   sw_feed:cursor:{wallet}        = JSON {last_sig, last_check_ts}
   sw_feed:alerted:{ca}           = "1", TTL 24h (dedupe alert)
+  sw_feed:signals                = LIST of JSON signal events, capped at SIGNAL_LOG_MAX
   sw_accum:holders:{ca}          = JSON list of {wallet, label, ts}, TTL 30 days
   sw_accum:entry:{ca}:{wallet}   = "1", TTL 7 days (per-wallet dedup)
 """
@@ -37,6 +38,7 @@ SIG_LIMIT         = 10           # latest 10 sigs per wallet
 ALERT_DEDUPE_TTL  = 86400        # 24h — one alert per token per day max
 ACCUM_HOLDERS_TTL = 30 * 86400   # 30 days — remember all wallet holders per CA
 ACCUM_ENTRY_TTL   = 7 * 86400    # 7 days — dedup per (mint+wallet) entry
+SIGNAL_LOG_MAX    = 200          # cap the queryable signal log (chat-brain tool feeds from this)
 TIMEOUT           = 8
 
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
@@ -136,6 +138,54 @@ def _mark_alerted(mint: str):
         _redis.set(f"sw_feed:alerted:{mint}", "1", ex=ALERT_DEDUPE_TTL)
     except Exception:
         pass
+
+
+# ---------- SIGNAL LOG (queryable by chat-brain state tool) ----------
+
+def _persist_signal(mint: str, prior_holders: list, new_buyer: dict,
+                    age_min, rug_result: dict | None):
+    """Append a structured record of this convergence event so the chat LLM
+    can answer 'what smart-wallet signals have fired' without hallucinating.
+    Capped at SIGNAL_LOG_MAX entries via LTRIM."""
+    try:
+        d = (rug_result or {}).get("details") or {}
+        wallets = list(prior_holders) + [{
+            "wallet": new_buyer.get("wallet"),
+            "label":  new_buyer.get("label"),
+            "ts":     new_buyer.get("ts"),
+        }]
+        entry = {
+            "ts":            int(time.time()),
+            "mint":          mint,
+            "symbol":        d.get("symbol"),
+            "age_minutes":   round(age_min, 1) if age_min is not None else None,
+            "wallet_count":  len(wallets),
+            "wallet_labels": [w.get("label") for w in wallets if w.get("label")],
+            "new_buyer":     new_buyer.get("label"),
+            "verdict":       (rug_result or {}).get("verdict") or "UNCHECKED",
+            "mc":            d.get("market_cap"),
+            "liq":           d.get("liquidity_usd"),
+        }
+        _redis.lpush("sw_feed:signals", json.dumps(entry))
+        _redis.ltrim("sw_feed:signals", 0, SIGNAL_LOG_MAX - 1)
+    except Exception as e:
+        log.warning(f"sw_feed _persist_signal failed: {e}")
+
+
+def get_recent_signals(limit: int = 20) -> list:
+    """Public reader for the chat-brain state tool. Newest first."""
+    try:
+        raw = _redis.lrange("sw_feed:signals", 0, max(0, int(limit) - 1)) or []
+        out = []
+        for r in raw:
+            try:
+                out.append(json.loads(r))
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        log.warning(f"sw_feed get_recent_signals failed: {e}")
+        return []
 
 
 # ---------- ACCUMULATION TRACKING (no time window, no age gate) ----------
@@ -253,6 +303,7 @@ def _trigger_accumulation_alert(mint: str, prior_holders: list, new_buyer: dict)
             log.warning(f"sw_feed accum alert send failed: {e}")
 
     _mark_alerted(mint)
+    _persist_signal(mint, prior_holders, new_buyer, age_min, rug_result)
 
     try:
         import memory_store

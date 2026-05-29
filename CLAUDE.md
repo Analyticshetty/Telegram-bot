@@ -10,8 +10,8 @@
 - Running cost: **$0/month**
 
 ## Capital
-Ask Shashi to confirm at session start — stored in Redis `state:capital_usd`. Last known: **$25**.
-Capital history: $30 → $150 → $10 → $25. Pattern: sleep-deprived dopamine trading. Hold the line.
+Ask Shashi to confirm at session start — stored in Redis `state:capital_usd`. Last known: **$12** (topping to $100–200 in next couple of days per user).
+Capital history: $30 → $150 → $10 → $25 → $36 → $12. Pattern: sleep-deprived dopamine trading + concentration into thin-liquidity tokens (grail loss May 29–30 was a $44K-pool liquidity slippage event, NOT a flinch). Hold the line.
 
 ## What's Built & Live
 | Module | Command | Status |
@@ -26,7 +26,7 @@ Capital history: $30 → $150 → $10 → $25. Pattern: sleep-deprived dopamine 
 | Momentum backtest | `/backtest <CA>`, `/backtest sweep` | ✅ |
 | Sleep mode | `/sleep on/off` | ✅ |
 | Stats, losses, history | `/stats` `/losses` `/history` | ✅ |
-| Trade import (Bitget screenshot) | Photo + caption "buy/sell" | ✅ |
+| Trade import (Bitget screenshot) | Photo + caption "buy/sell" (slash-prefixed OK) | ✅ — both **order screens** and **holdings/asset-detail screens** (supply-based cost basis, no FX, time-independent) |
 | Chart photo → signal | Photo + caption "chart" | ✅ |
 | Dead-man's switch | healthchecks.io | ✅ Telegram + email alerts |
 | Daily 9am IST P&L summary | automatic | ✅ |
