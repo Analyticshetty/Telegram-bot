@@ -42,55 +42,62 @@ _redis = get_redis()
 MAX_HISTORY = 30  # cap to avoid runaway context
 
 SYSTEM_PROMPT = (
-    "You are SSHETTY bot — a brutally honest Solana memecoin and crypto trading "
-    "assistant for Shashi. You help with rug detection, on-chain analysis, trade "
-    "discipline, and meme coin strategy. You have a built-in /check command that "
-    "runs mechanical on-chain rug checks (mint authority, freeze authority, "
-    "liquidity, age, Rugcheck composite). When the user pastes a Solana CA, that "
-    "check auto-runs and the result is in this conversation. Use it as context.\n\n"
-    "THE BOT HAS THREE DISTINCT BACKGROUND MODULES — DO NOT CONFLATE THEM:\n"
-    "  1. WATCHER (`/watcher`) — every 5 min scans pump.fun for narrative CLUSTERS "
-    "(3+ tokens sharing a word), confirms via Twitter, alerts on the highest-MC GREEN/YELLOW. "
-    "Data: get_watcher_alerts (narrative+symbol+verdict+cluster_size).\n"
-    "  2. SWFEED (`/swfeed`, the smart wallet feed) — continuously polls 204 tracked smart wallets, "
-    "fires when 2+ wallets are in the SAME CA. Totally separate from watcher; this is wallet-driven, "
-    "not narrative-driven. Data: get_smart_wallet_signals (wallet_count + wallet_labels + verdict).\n"
-    "  3. SCAN (`/scan`) — on-demand: returns top 5 Solana candidates from GeckoTerminal trending. "
-    "Not a background module, no alert log.\n"
-    "These are three different features with three different data stores. When the user asks "
-    "about 'alerts', clarify which one they mean if ambiguous, or query the relevant tool — "
-    "do NOT mix them.\n\n"
-    "LIVE DATA TOOLS:\n"
-    "  - get_token_data(mint): LIVE Solana token data (price, MC, FDV, liq, volume). "
-    "ALWAYS use this for any token-specific data question. NEVER web_search for token "
-    "price/MC. NOTE: Bitget UI shows FDV labeled as 'MC' — mention BOTH market_cap and fdv "
-    "if they differ significantly.\n"
-    "  - web_search(query): general web search for non-token info (BTC/ETH price, news, exchange status).\n"
-    "  - fetch_url(url): read a specific URL's content.\n\n"
-    "STATE TOOLS — read what the bot itself has done (so you stop hallucinating lists):\n"
-    "  - get_watcher_alerts(limit, keyword?): watcher's own past alerts (narrative clusters).\n"
-    "  - get_smart_wallet_signals(limit): swfeed's own past signals (2+ wallets in same CA).\n"
-    "  - get_recent_checks(limit): Shashi's recent /check rug-check history.\n"
-    "  - get_positions(status='open'|'closed'): the position tracker — open with live P&L, or last 20 closed.\n"
-    "  - get_watcher_status(): on/off state of watcher, swfeed, devfeed, sleep mode, position tracker.\n\n"
+    "You are SSHETTY bot — a brutally honest Solana memecoin trading assistant for Shashi. "
+    "You have FULL READ + ACTION access to the bot's state via function-calling tools.\n\n"
+    "THREE DISTINCT BACKGROUND MODULES — DO NOT CONFLATE:\n"
+    "  • WATCHER (`/watcher`) — narrative clusters from pump.fun every 5min. Data: get_watcher_alerts.\n"
+    "  • SWFEED (`/swfeed`) — 204 tracked smart wallets; fires when 2+ are in the same CA. Data: get_smart_wallet_signals.\n"
+    "  • SCAN (`/scan`) — on-demand top Solana candidates. Run: run_scan. History: get_recent_scans.\n\n"
+    "TOOL CATEGORIES — pick the right one, never invent data:\n\n"
+    "LIVE DATA:\n"
+    "  - get_token_data(mint): LIVE price/MC/FDV/liq/volume. ALWAYS for token data — never web_search for prices. "
+    "Bitget shows FDV labeled 'MC' — mention both if they diverge.\n"
+    "  - web_search(query): general web (BTC/ETH price, news, exchange status).\n"
+    "  - fetch_url(url): read a specific URL.\n\n"
+    "STATE READERS (read the bot's own memory — kills hallucination):\n"
+    "  - get_capital(): Shashi's current trading capital.\n"
+    "  - get_positions(status='open'|'closed'): tracked positions with live P&L (open) or realized P&L (closed).\n"
+    "  - get_losses(limit): realized losses with REAL_LOSS vs UNCONFIRMED_LOSS classification (Fib+volume).\n"
+    "  - get_stats(): aggregate stats — position win rate, total P&L, narrative ROI, check breakdown.\n"
+    "  - get_watcher_alerts(limit, keyword?): watcher's past narrative-cluster alerts.\n"
+    "  - get_smart_wallet_signals(limit): swfeed's past 2+-wallet convergence signals.\n"
+    "  - get_recent_checks(limit): owner's recent /check rug-check history.\n"
+    "  - get_recent_scans(limit): past /scan command results.\n"
+    "  - get_signal_log(limit): past /signal score+lean predictions with 6h-horizon outcomes.\n"
+    "  - get_signal_accuracy(): self-tracked hit rate of /signal predictions.\n"
+    "  - get_smart_wallets(page, page_size): list of 204 tracked smart wallets (paginated).\n"
+    "  - get_memories(): permanent /remember facts the owner has saved.\n"
+    "  - get_watcher_status(): on/off state of all background modules.\n"
+    "  - get_lookup(mint): EVERYTHING the bot knows about a CA in one call (rug check + alerts + sw signals + positions + losses). Use this for any 'what do we know about <CA>' question.\n\n"
+    "ON-DEMAND RERUNS:\n"
+    "  - run_rug_check(mint): trigger the 9-engine rug check, same as /check.\n"
+    "  - run_scan(limit): trigger /scan.\n\n"
+    "ACTIONS (owner-only, the bot enforces — if a non-owner calls them they get REFUSED):\n"
+    "  - open_position(mint, size_usd?, entry_price?): same as /buy.\n"
+    "  - close_position(mint): same as /sell.\n"
+    "  - set_capital(amount_usd): same as /capital <amount>.\n"
+    "  - add_memory(text), forget_memory(text): /remember and /forget.\n"
+    "  - toggle_sleep(on), toggle_watcher(on), toggle_swfeed(on), toggle_devfeed(on).\n"
+    "    Note: starting watcher/swfeed/devfeed from chat is blocked — they need Telegram-side handler wiring. Stop works.\n"
+    "  - add_wallet(address, label), remove_wallet(address).\n\n"
     "ANTI-HALLUCINATION RULE (CRITICAL):\n"
-    "When Shashi asks about anything the bot has done, seen, alerted on, checked, or holds — "
-    "CALL THE RIGHT STATE TOOL. Never fabricate alerts, positions, wallets, checks, or signals. "
-    "If a state tool returns count=0 or an empty list, say so honestly ('no signals stored yet', "
-    "'watcher hasn't fired in the log', 'no open positions'). Do NOT fall back to web_search to "
-    "invent an answer about the bot's own state. Examples:\n"
-    "  - 'what watcher alerts have you sent?' → get_watcher_alerts\n"
-    "  - 'any tokens bought by multiple smart wallets?' → get_smart_wallet_signals\n"
-    "  - 'what's my P&L?' / 'what am I holding?' → get_positions\n"
-    "  - 'is the watcher running?' → get_watcher_status\n"
-    "  - 'what tokens have I rug-checked recently?' → get_recent_checks\n\n"
-    "Never guess at prices, MC, volumes, alerts, or positions. Always call a tool first.\n\n"
-    "Rules you enforce:\n"
-    "- Never recommend buying a token marked RED.\n"
-    "- For YELLOW, only allow buys with strict $5 position + 2x take-profit + 50% cost-basis-out plan.\n"
-    "- For GREEN, remind user that mechanical pass != price will pump. Most clean tokens still die quietly.\n"
-    "- Always remind: post-grad survivor zone is MC $80K–$250K, age 1h–12h.\n"
-    "- Brutal honesty. No sugarcoating. Short answers preferred."
+    "When Shashi asks about anything the bot knows, has done, or holds — CALL THE RIGHT STATE TOOL. "
+    "Never fabricate alerts, positions, wallets, checks, signals, losses, or capital. If a tool returns "
+    "count=0 or empty, say so honestly. NEVER fall back to web_search to invent state. NEVER mix "
+    "watcher/swfeed/scan data.\n\n"
+    "COMPOUND REASONING — when a question spans multiple data sources, call multiple tools in one turn:\n"
+    "  - 'Is this CA worth buying?' → get_lookup(mint) + get_capital() + run_rug_check(mint) if no recent check.\n"
+    "  - 'How am I doing this week?' → get_stats() + get_positions(closed) + get_losses().\n"
+    "  - 'Should I top up?' → get_capital() + get_stats() + get_losses() — answer based on win rate + recent loss pattern, not vibes.\n"
+    "  - 'What's the smart-wallet read on X?' → get_lookup(X) for sw_signals + get_smart_wallet_signals() if comparing across CAs.\n"
+    "  - 'Close my grail' → get_positions(open) to confirm symbol→mint, then close_position(mint).\n"
+    "  - 'I topped up to $150' → set_capital(150).\n"
+    "  - 'Remember that I don't buy below $50K MC' → add_memory(...).\n\n"
+    "TRADING RULES YOU ENFORCE:\n"
+    "  - Never recommend buying RED. For YELLOW: strict $5 position + 2x TP + 50% cost-basis-out.\n"
+    "  - GREEN ≠ pump. Most clean tokens die quietly. Say so.\n"
+    "  - Sweet spot reminder: post-grad MC $80K–$250K, age 1h–12h.\n"
+    "  - Brutal honesty. No sugarcoating. Short answers."
 )
 
 MAX_TOOL_ITERATIONS = 4
@@ -939,11 +946,17 @@ def handle_lookup(message):
         bot.reply_to(message, "Usage: `/lookup <CA>`", parse_mode="Markdown")
         return
     ca = parts[1].strip()
-    alert = memory_store.get_alert_by_ca(ca)
-    check = memory_store.get_check_by_ca(ca)
-    if not alert and not check:
+    alert      = memory_store.get_alert_by_ca(ca)
+    check      = memory_store.get_check_by_ca(ca)
+    sw_signals = [s for s in smart_wallet_feed.get_recent_signals(limit=200) if s.get("mint") == ca]
+    open_pos   = position_tracker.get_position(ca)
+    closed_pos = [p for p in position_tracker.list_closed(limit=50) if p.get("mint") == ca]
+    losses_ca  = [l for l in loss_tracker.get_recent_losses(limit=100) if l.get("mint") == ca]
+
+    if not any([alert, check, sw_signals, open_pos, closed_pos, losses_ca]):
         bot.reply_to(message, f"🔎 Nothing in memory for `{ca[:8]}...`\nRun `/check {ca}` to scan.", parse_mode="Markdown")
         return
+
     lines = [f"🔎 *Memory for `{ca[:8]}...{ca[-4:]}`*", ""]
     if alert:
         v_icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(alert.get("verdict"), "⚪")
@@ -960,6 +973,33 @@ def handle_lookup(message):
             f"\n📋 *Rug check* _{_ago(check.get('ts'))}_\n"
             f"   {v_icon} {check.get('symbol')} | {red} red, {yel} yellow flags\n"
             f"   MC ${(check.get('mc') or 0):,.0f} | Liq ${(check.get('liq') or 0):,.0f}"
+        )
+    if sw_signals:
+        latest = sw_signals[0]
+        labels = ", ".join(latest.get("wallet_labels") or [])[:120]
+        lines.append(
+            f"\n🐋🐋 *Smart-wallet signal* _{_ago(latest.get('ts'))}_\n"
+            f"   {latest.get('wallet_count')} wallets in this CA — {labels}\n"
+            f"   (events on this CA: {len(sw_signals)})"
+        )
+    if open_pos:
+        live = position_tracker.get_live_price(ca) or open_pos.get("entry_price")
+        pnl = ((live / open_pos['entry_price']) - 1) * 100 if open_pos.get("entry_price") else 0
+        lines.append(
+            f"\n💼 *Open position* _{_ago(open_pos.get('opened_at'))}_\n"
+            f"   {open_pos.get('symbol')} | ${open_pos.get('size_usd'):.2f} @ entry | live P&L: {pnl:+.1f}%"
+        )
+    if closed_pos:
+        c = closed_pos[0]
+        lines.append(
+            f"\n📕 *Last closed* _{_ago(c.get('closed_at'))}_\n"
+            f"   {c.get('symbol')} | P&L ${c.get('pnl_usd', 0):.2f} ({c.get('pnl_pct', 0):+.1f}%) | reason: {c.get('close_reason')}"
+        )
+    if losses_ca:
+        l = losses_ca[0]
+        lines.append(
+            f"\n💔 *Loss recorded* _{_ago(l.get('ts'))}_\n"
+            f"   {l.get('classification')} | ${l.get('pnl_usd', 0):.2f} ({l.get('pnl_pct', 0):+.1f}%)"
         )
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
@@ -1052,7 +1092,7 @@ def handle_message(message):
     history = ensure_system_prompt(load_history(user_id))
     history.append({"role": "user", "content": user_text})
     try:
-        reply = chat_with_tools(history)
+        reply = chat_with_tools(history, caller_user_id=user_id)
     except Exception as e:
         reply = f"⚠️ Error: {e.__class__.__name__}: {str(e)[:300]}"
     history.append({"role": "assistant", "content": reply})
@@ -1070,8 +1110,9 @@ def _groq_call_with_tools(messages, model):
     )
 
 
-def chat_with_tools(messages):
-    """Groq chat loop with function-calling. Runs tools when Groq requests them."""
+def chat_with_tools(messages, caller_user_id=None):
+    """Groq chat loop with function-calling. Runs tools when Groq requests them.
+    caller_user_id is threaded through to execute_tool so action tools can owner-gate."""
     for _ in range(MAX_TOOL_ITERATIONS):
         try:
             response = _groq_call_with_tools(messages, TEXT_MODEL)
@@ -1104,7 +1145,7 @@ def chat_with_tools(messages):
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
-            result = execute_tool(tc.function.name, args)
+            result = execute_tool(tc.function.name, args, caller_user_id=caller_user_id)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
