@@ -38,8 +38,8 @@ def _classify_outcome(closed_position: dict) -> str:
 
 
 def position_stats() -> dict:
-    closed = position_tracker.list_closed(limit=500)
-    open_pos = position_tracker.list_open()
+    closed = [c for c in (position_tracker.list_closed(limit=500) or []) if c]
+    open_pos = [p for p in (position_tracker.list_open() or []) if p]
 
     n_closed = len(closed)
     if n_closed == 0:
@@ -114,8 +114,8 @@ def check_stats(user_id) -> dict:
 
 def narrative_performance() -> list:
     """Cross-reference alerts with closed positions to see which narratives paid off."""
-    alerts = memory_store.get_recent_alerts(limit=500)
-    closed = position_tracker.list_closed(limit=500)
+    alerts = [a for a in (memory_store.get_recent_alerts(limit=500) or []) if a]
+    closed = [c for c in (position_tracker.list_closed(limit=500) or []) if c]
 
     # Build mint → narrative map from alerts
     mint_to_narrative = {}

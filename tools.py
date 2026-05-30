@@ -519,7 +519,7 @@ def get_lookup(mint: str) -> str:
         # Smart-wallet signal events for this CA
         try:
             all_sigs = smart_wallet_feed.get_recent_signals(limit=200)
-            matching = [s for s in all_sigs if s.get("mint") == mint]
+            matching = [s for s in (all_sigs or []) if s and s.get("mint") == mint]
             out["sw_signals_count"] = len(matching)
             out["sw_signals"] = [{
                 "ago":          _ago_str(s.get("ts")),
@@ -553,7 +553,7 @@ def get_lookup(mint: str) -> str:
         # Closed positions on this CA
         try:
             closed = position_tracker.list_closed(limit=50)
-            matching_c = [p for p in closed if p.get("mint") == mint]
+            matching_c = [p for p in (closed or []) if p and p.get("mint") == mint]
             out["closed_positions"] = [{
                 "ago":          _ago_str(p.get("closed_at")),
                 "symbol":       p.get("symbol"),
@@ -568,7 +568,7 @@ def get_lookup(mint: str) -> str:
         # Loss log entries for this CA
         try:
             losses = loss_tracker.get_recent_losses(limit=100)
-            matching_l = [l for l in losses if l.get("mint") == mint]
+            matching_l = [l for l in (losses or []) if l and l.get("mint") == mint]
             out["losses"] = [{
                 "ago":            _ago_str(l.get("ts")),
                 "classification": l.get("classification"),
@@ -918,7 +918,7 @@ TOOLS_SCHEMA = [
 
 # ---------- Dispatcher ----------
 
-def execute_tool(name: str, args: dict, caller_user_id=None) -> str:
+def _execute_tool_impl(name: str, args: dict, caller_user_id=None) -> str:
     # External
     if name == "web_search":      return web_search(args.get("query", ""))
     if name == "get_token_data":  return get_token_data(args.get("mint", ""))
@@ -958,3 +958,20 @@ def execute_tool(name: str, args: dict, caller_user_id=None) -> str:
     if name == "remove_wallet":   return remove_wallet_action(args.get("address"), caller_user_id)
 
     return f"Unknown tool: {name}"
+
+
+def execute_tool(name: str, args: dict, caller_user_id=None) -> str:
+    """Public dispatcher with a safety wrap. ANY tool crash returns a clean
+    error string to the LLM instead of bubbling up and breaking the chat reply."""
+    try:
+        if args is None:
+            args = {}
+        return _execute_tool_impl(name, args, caller_user_id)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc(limit=2)
+        return json.dumps({
+            "tool":  name,
+            "error": f"{e.__class__.__name__}: {str(e)[:200]}",
+            "hint":  "Tool crashed — fall back to the next-best tool or tell Shashi the data is unavailable. Do NOT fabricate.",
+        })
