@@ -141,11 +141,14 @@ def get_watcher_alerts(limit: int = 20, keyword: str = None) -> str:
             entries = memory_store.search_alerts(keyword, limit=200)[:limit]
         else:
             entries = memory_store.get_recent_alerts(limit=limit)
+        entries = [e for e in (entries or []) if e]
         if not entries:
             return json.dumps({"count": 0, "alerts": [],
                                "note": "No watcher alerts stored. Either watcher is off or nothing has fired."})
         out = []
         for a in entries:
+            if not isinstance(a, dict):
+                continue
             out.append({
                 "ago":       _ago_str(a.get("ts")),
                 "narrative": a.get("narrative"),
@@ -168,12 +171,14 @@ def get_recent_checks(limit: int = 20) -> str:
         import memory_store
         limit = max(1, min(int(limit or 20), 100))
         user_id = OWNER_TELEGRAM_ID or ""
-        entries = memory_store.get_recent_checks(user_id, limit=limit)
+        entries = [e for e in (memory_store.get_recent_checks(user_id, limit=limit) or []) if e]
         if not entries:
             return json.dumps({"count": 0, "checks": [],
                                "note": "No /check history stored yet."})
         out = []
         for c in entries:
+            if not isinstance(c, dict):
+                continue
             out.append({
                 "ago":     _ago_str(c.get("ts")),
                 "symbol":  c.get("symbol"),
@@ -194,12 +199,14 @@ def get_smart_wallet_signals(limit: int = 20) -> str:
     try:
         import smart_wallet_feed
         limit = max(1, min(int(limit or 20), 100))
-        entries = smart_wallet_feed.get_recent_signals(limit=limit)
+        entries = [e for e in (smart_wallet_feed.get_recent_signals(limit=limit) or []) if e]
         if not entries:
             return json.dumps({"count": 0, "signals": [],
                                "note": "No smart-wallet signals stored yet. Either swfeed hasn't fired or it's off."})
         out = []
         for s in entries:
+            if not isinstance(s, dict):
+                continue
             out.append({
                 "ago":          _ago_str(s.get("ts")),
                 "symbol":       s.get("symbol"),
@@ -226,11 +233,14 @@ def get_positions(status: str = "open") -> str:
             raw = position_tracker.list_closed(limit=20)
         else:
             raw = position_tracker.list_open()
+        raw = [p for p in (raw or []) if p]
         if not raw:
             return json.dumps({"status": status, "count": 0, "positions": [],
                                "note": f"No {status} positions."})
         out = []
         for p in raw:
+            if not isinstance(p, dict):
+                continue
             row = {
                 "symbol":      p.get("symbol"),
                 "mint":        p.get("mint"),
@@ -314,12 +324,14 @@ def get_losses(limit: int = 20) -> str:
     try:
         import loss_tracker
         limit = max(1, min(int(limit or 20), 100))
-        losses = loss_tracker.get_recent_losses(limit=limit)
+        losses = [l for l in (loss_tracker.get_recent_losses(limit=limit) or []) if l]
         if not losses:
             return json.dumps({"count": 0, "losses": [],
                                "note": "No losses logged yet."})
         out = []
         for l in losses:
+            if not isinstance(l, dict):
+                continue
             out.append({
                 "ago":         _ago_str(l.get("ts")),
                 "symbol":      l.get("symbol"),
@@ -376,7 +388,7 @@ def get_smart_wallets(page: int = 1, page_size: int = 25) -> str:
         import smart_wallets
         page = max(1, int(page or 1))
         page_size = max(1, min(int(page_size or 25), 50))
-        all_w = smart_wallets.load_wallets()
+        all_w = [w for w in (smart_wallets.load_wallets() or []) if isinstance(w, dict)]
         total = len(all_w)
 
         # Break down by source so the LLM can answer either "how many tracked"
@@ -390,7 +402,7 @@ def get_smart_wallets(page: int = 1, page_size: int = 25) -> str:
                 manual.append(w.get("label"))
 
         start = (page - 1) * page_size
-        chunk = all_w[start:start + page_size]
+        chunk = [w for w in all_w[start:start + page_size] if isinstance(w, dict)]
         labels_sample = [w.get("label") for w in chunk if w.get("label")]
         out = [{"address": (w.get("address") or "")[:10] + "...",
                 "label":   w.get("label"),
@@ -433,11 +445,13 @@ def get_recent_scans(limit: int = 10) -> str:
     try:
         import memory_store
         limit = max(1, min(int(limit or 10), 50))
-        scans = memory_store.get_recent_scans(limit=limit)
+        scans = [s for s in (memory_store.get_recent_scans(limit=limit) or []) if s]
         if not scans:
             return json.dumps({"count": 0, "scans": [], "note": "No scans run yet."})
         out = []
         for s in scans:
+            if not isinstance(s, dict):
+                continue
             out.append({
                 "ago":           _ago_str(s.get("ts")),
                 "results_count": s.get("results_count"),
@@ -458,12 +472,16 @@ def get_signal_log(limit: int = 20) -> str:
         ids = r.zrevrange(signal_engine.K_BY_TS, 0, limit - 1) or []
         out = []
         for sid in ids:
+            if not sid:
+                continue
             raw = r.hget(signal_engine.K_STORE, sid)
             if not raw:
                 continue
             try:
                 sig = json.loads(raw)
             except Exception:
+                continue
+            if not isinstance(sig, dict):
                 continue
             out.append({
                 "ago":      _ago_str(sig.get("created_ts") or sig.get("ts")),

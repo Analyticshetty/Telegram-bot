@@ -99,11 +99,16 @@ def _all_wallets() -> list:
 
 
 def load_wallets() -> list:
-    """Active wallets only — TODOs skipped."""
-    return [
-        w for w in _all_wallets()
-        if w.get("address") and not str(w["address"]).startswith("TODO")
-    ]
+    """Active wallets only — TODOs and corrupt entries skipped."""
+    out = []
+    for w in (_all_wallets() or []):
+        if not w or not isinstance(w, dict):
+            continue
+        addr = w.get("address")
+        if not addr or str(addr).startswith("TODO"):
+            continue
+        out.append(w)
+    return out
 
 
 # ---------- CRUD ----------
