@@ -369,35 +369,60 @@ def get_memories() -> str:
 
 
 def get_smart_wallets(page: int = 1, page_size: int = 25) -> str:
-    """List tracked smart wallets. Returns total count + a sample of labels so
-    the LLM doesn't get overwhelmed and falsely report 'none'."""
+    """List tracked smart wallets. Returns total + source breakdown + sample.
+    Separates manual-added from auto-discovered so 'have I added' questions
+    are answered correctly without filtering anything out."""
     try:
         import smart_wallets
         page = max(1, int(page or 1))
         page_size = max(1, min(int(page_size or 25), 50))
         all_w = smart_wallets.load_wallets()
         total = len(all_w)
+
+        # Break down by source so the LLM can answer either "how many tracked"
+        # or "how many did I manually add" without guessing.
+        source_counts = {}
+        manual = []
+        for w in all_w:
+            src = (w.get("source") or "unknown").lower()
+            source_counts[src] = source_counts.get(src, 0) + 1
+            if src in ("manual", "chat", "user", "addwallet"):
+                manual.append(w.get("label"))
+
         start = (page - 1) * page_size
         chunk = all_w[start:start + page_size]
         labels_sample = [w.get("label") for w in chunk if w.get("label")]
         out = [{"address": (w.get("address") or "")[:10] + "...",
                 "label":   w.get("label"),
                 "source":  w.get("source")} for w in chunk]
-        summary = (
-            f"{total} smart wallets tracked total. "
-            f"Page {page} (size {page_size}) returns {len(out)} entries."
-            if total > 0
-            else "Wallet list is EMPTY. Either Redis was wiped or smart_wallets:data is missing. "
-                 "Tell Shashi to run /listwallets to confirm, and /discoverwallet to rebuild if so."
-        )
+
+        if total > 0:
+            summary = (
+                f"{total} smart wallets tracked total. "
+                f"By source: {source_counts}. "
+                f"Manually added by Shashi: {len(manual)}. "
+                f"The rest were seeded or auto-discovered. "
+                f"Page {page} (size {page_size}) returns {len(out)} entries."
+            )
+        else:
+            summary = ("Wallet list is EMPTY. Either Redis was wiped or smart_wallets:data is missing. "
+                       "Tell Shashi to run /listwallets to confirm, and /discoverwallet to rebuild if so.")
+
         return json.dumps({
-            "summary":       summary,
-            "total":         total,
-            "page":          page,
-            "page_size":     page_size,
-            "returned":      len(out),
-            "labels_sample": labels_sample,
-            "wallets":       out,
+            "summary":         summary,
+            "total":           total,
+            "source_counts":   source_counts,
+            "manual_count":    len(manual),
+            "manual_labels":   manual[:20],
+            "page":            page,
+            "page_size":       page_size,
+            "returned":        len(out),
+            "labels_sample":   labels_sample,
+            "wallets":         out,
+            "hint": ("If user asks 'which/how many smart wallets', answer with 'total' "
+                     "(204 typically). If user asks 'which did I ADD/MANUALLY ADD', "
+                     "answer with 'manual_count' + 'manual_labels'. Do NOT say 'none' "
+                     "unless 'total' is actually 0."),
         })
     except Exception as e:
         return f"get_smart_wallets error: {e.__class__.__name__}: {e}"
