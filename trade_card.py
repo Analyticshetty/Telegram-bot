@@ -3,7 +3,7 @@ Module 3 — Trade Card.
 
 Advisory only. Reads capital from Redis (set:capital_usd), computes:
   - Entry size in USD (15% of capital for GREEN, fixed $5 for YELLOW)
-  - TP1 at 2x (sell 50% — recovers cost basis, Shashi's proven edge)
+  - TP1 at 2x (sell 50% — recovers cost basis, proven edge)
   - TP2 at 3x (sell remainder, ride free)
   - SL at -30% (memecoin standard)
 

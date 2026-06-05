@@ -9,7 +9,7 @@ And they NEVER show you their real hit rate — that's the whole business model.
 This module copies the useful part (multi-signal scoring on REAL data we already
 compute in rug_check) and adds the part they leave out: every signal is logged with
 its entry price, then resolved against what the token actually did 6h later. So
-`/signal stats` shows Shashi his OWN tracked accuracy. If it's a coinflip, he'll know.
+`/signal stats` shows the user their OWN tracked accuracy. If it's a coinflip, they'll know.
 
 NO candle-reading from chart images. NO invented confidence. NO trade execution
 (handover rule #2 — 12 risk rules still unconfirmed). RED tokens get no trade card.
@@ -118,7 +118,7 @@ def _score_from_details(verdict: str, d: dict) -> tuple[int, list[str]]:
     elif sniper == "MEDIUM":
         adj(-4, "sniper concentration medium")
 
-    # --- Lifecycle sweet spot (post-grad survivor is Shashi's zone) ---
+    # --- Lifecycle sweet spot (post-grad survivor zone) ---
     stage = d.get("lifecycle_stage")
     if stage == "post_grad":
         adj(6, "post-grad survivor (the sweet spot)")

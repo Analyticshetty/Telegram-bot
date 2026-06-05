@@ -756,5 +756,22 @@ def format_report(result: dict) -> str:
     if tc:
         lines.append(tc)
 
+    # Capital Guard preview — projects size/liq/slippage at default 15% sizing.
+    # Skip for RED (no sizing anyway) and INVALID.
+    try:
+        if result.get("verdict") in ("GREEN", "YELLOW"):
+            import capital_guard
+            from trade_card import get_capital_usd, GREEN_POSITION_PCT, YELLOW_POSITION_USD
+            cap = get_capital_usd()
+            default_size = (round(cap * GREEN_POSITION_PCT, 2) if result["verdict"] == "GREEN"
+                            else min(YELLOW_POSITION_USD, round(cap * GREEN_POSITION_PCT, 2)))
+            liq = d.get("liquidity_usd")
+            panel = capital_guard.format_check_panel(liq, cap, default_size)
+            if panel:
+                lines.append("\n" + panel)
+    except Exception as e:
+        # Never let guard break the report
+        lines.append(f"\n_(Capital Guard preview failed: {e.__class__.__name__})_")
+
     lines.append("\n_Mechanical on-chain checks only. Does not predict price, dead launches, slow rugs, or your discipline._")
     return "\n".join(lines)

@@ -408,17 +408,20 @@ def get_smart_wallets(page: int = 1, page_size: int = 25) -> str:
                 "label":   w.get("label"),
                 "source":  w.get("source")} for w in chunk]
 
+        auto_count = total - len(manual)
         if total > 0:
             summary = (
-                f"{total} smart wallets tracked total. "
-                f"By source: {source_counts}. "
-                f"Manually added by Shashi: {len(manual)}. "
-                f"The rest were seeded or auto-discovered. "
+                f"TOTAL TRACKED: {total} wallets. "
+                f"MANUALLY ADDED: {len(manual)}. "
+                f"AUTO-DISCOVERED/SEEDED: {auto_count}. "
+                f"When answering 'how many wallets tracked' use {total}. "
+                f"When answering 'manually added vs auto' say "
+                f"'{len(manual)} manual, {auto_count} auto-discovered/seeded, {total} total'. "
                 f"Page {page} (size {page_size}) returns {len(out)} entries."
             )
         else:
             summary = ("Wallet list is EMPTY. Either Redis was wiped or smart_wallets:data is missing. "
-                       "Tell Shashi to run /listwallets to confirm, and /discoverwallet to rebuild if so.")
+                       "Tell the user to run /listwallets to confirm, and /discoverwallet to rebuild if so.")
 
         return json.dumps({
             "summary":         summary,
@@ -961,7 +964,63 @@ TOOLS_SCHEMA = [
 
 # ---------- Dispatcher ----------
 
-def _execute_tool_impl(name: str, args: dict, caller_user_id=None) -> str:
+# Actions that mutate trading state — must go through /confirm step when called
+# from chat (LLM). Direct command handlers (/buy, /sell, /capital) skip this
+# wrap because the user typed the command themselves.
+DANGEROUS_ACTIONS = {"close_position", "open_position", "set_capital"}
+
+
+def _park_pending_action(name: str, args: dict, caller_user_id) -> str:
+    """Queue a dangerous action for explicit /confirm. 90s TTL.
+    Returns a Telegram-friendly prompt the LLM should pass through verbatim."""
+    try:
+        from redis_client import get_redis as _gr
+        import time as _t
+        payload = {
+            "name": name,
+            "args": args or {},
+            "caller_user_id": caller_user_id,
+            "queued_at": int(_t.time()),
+        }
+        _gr().set("pending_action:current", json.dumps(payload), ex=90)
+        # Build a human-readable description
+        if name == "close_position":
+            desc = f"close position on `{args.get('mint','?')}`"
+        elif name == "open_position":
+            desc = (f"OPEN position on `{args.get('mint','?')}` "
+                    f"size=${args.get('size_usd') or '15% cap'}")
+        elif name == "set_capital":
+            desc = f"set capital to ${args.get('amount_usd','?')}"
+        else:
+            desc = f"run `{name}` with {args}"
+        return json.dumps({
+            "ok": True,
+            "pending": True,
+            "summary_for_user":
+                f"⚠ Pending action: {desc}\n"
+                f"   Reply `/confirm` within 90s to execute, or `/cancel` to drop. "
+                f"This step exists because LLM misreads of ambiguous chat could close the "
+                f"wrong CA. /buy and /sell typed directly bypass this.",
+            "hint_for_llm":
+                "Pass summary_for_user back to the user verbatim. Do NOT call any other "
+                "action tool until he replies /confirm or /cancel.",
+        })
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"parking failed: {e}"})
+
+
+def _execute_action_direct(name: str, args: dict, caller_user_id=None) -> str:
+    """Bypass the confirmation wrap. Used by /confirm handler. Same dispatch
+    table as _execute_tool_impl but skips DANGEROUS_ACTIONS gating."""
+    return _execute_tool_impl(name, args or {}, caller_user_id, bypass_confirmation=True)
+
+
+def _execute_tool_impl(name: str, args: dict, caller_user_id=None,
+                       bypass_confirmation: bool = False) -> str:
+    # CHAT-action safety: park dangerous actions for /confirm
+    if name in DANGEROUS_ACTIONS and not bypass_confirmation:
+        return _park_pending_action(name, args, caller_user_id)
+
     # External
     if name == "web_search":      return web_search(args.get("query", ""))
     if name == "get_token_data":  return get_token_data(args.get("mint", ""))
@@ -1016,5 +1075,5 @@ def execute_tool(name: str, args: dict, caller_user_id=None) -> str:
         return json.dumps({
             "tool":  name,
             "error": f"{e.__class__.__name__}: {str(e)[:200]}",
-            "hint":  "Tool crashed — fall back to the next-best tool or tell Shashi the data is unavailable. Do NOT fabricate.",
+            "hint":  "Tool crashed — fall back to the next-best tool or tell the user the data is unavailable. Do NOT fabricate.",
         })

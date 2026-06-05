@@ -33,7 +33,12 @@ log = logging.getLogger(__name__)
 _redis = get_redis()
 
 # ---------- CONFIG ----------
-POLL_INTERVAL_SECS = 60        # check prices every minute
+POLL_INTERVAL_SECS = 60        # default check interval (deep liq)
+POLL_INTERVAL_THIN = 15        # thin-liq positions need faster polling — SL
+                               # slippage on $44K pool happens in seconds, not
+                               # minutes. Grail loss class.
+THIN_LIQ_THRESHOLD_USD = 100_000  # if any open position has liq below this,
+                                  # whole loop drops to POLL_INTERVAL_THIN
 TP1_MULT = 2.0
 TP1_SELL_PCT = 0.50
 TP2_MULT = 3.0
@@ -327,13 +332,47 @@ def _check_position(p: dict, send_alert_fn) -> tuple[dict, bool]:
     return (p, False)
 
 
+def _get_liq_usd(mint: str):
+    try:
+        r = requests.get(DEXSCREENER_URL.format(mint=mint), timeout=TIMEOUT)
+        if r.status_code == 200:
+            pairs = (r.json() or {}).get("pairs") or []
+            if pairs:
+                pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+                return float((pairs[0].get("liquidity") or {}).get("usd") or 0)
+    except Exception:
+        pass
+    return None
+
+
+def _effective_poll_interval(positions: list) -> int:
+    """If any open position is on thin liq, drop interval to POLL_INTERVAL_THIN.
+    Cached on position dict as `_liq_cache` to avoid hammering DEXScreener
+    (refreshed once per cycle in _check_position via get_live_price)."""
+    if not positions:
+        return POLL_INTERVAL_SECS
+    for p in positions:
+        # Use cached liq if available, else fetch
+        liq = p.get("_liq_cache")
+        if liq is None:
+            liq = _get_liq_usd(p.get("mint", ""))
+            p["_liq_cache"] = liq
+        if liq is not None and liq < THIN_LIQ_THRESHOLD_USD:
+            return POLL_INTERVAL_THIN
+    return POLL_INTERVAL_SECS
+
+
 def _loop(send_alert_fn):
     global _running
     log.info("Position tracker loop started.")
     while _running:
+        interval = POLL_INTERVAL_SECS
         try:
             positions = _load_open()
             if positions:
+                interval = _effective_poll_interval(positions)
+                if interval == POLL_INTERVAL_THIN:
+                    log.debug(f"Thin-liq position detected — polling at {interval}s")
                 updated_open = []
                 for p in positions:
                     new_p, should_close = _check_position(p, send_alert_fn)
@@ -347,13 +386,15 @@ def _loop(send_alert_fn):
                     # Reload fresh (close_position may have mutated)
                     current = {p["mint"]: p for p in _load_open()}
                     for u in updated_open:
-                        current[u["mint"]] = u
+                        # Strip ephemeral cache before persisting
+                        u_clean = {k: v for k, v in u.items() if not k.startswith("_")}
+                        current[u_clean["mint"]] = u_clean
                     _save_open(list(current.values()))
         except Exception as e:
             log.warning(f"Position tracker scan error: {e}")
 
         # Sleep in 1s chunks so stop() responds quickly
-        for _ in range(POLL_INTERVAL_SECS):
+        for _ in range(interval):
             if not _running:
                 break
             time.sleep(1)

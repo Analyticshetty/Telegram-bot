@@ -52,7 +52,7 @@ _user_locks_guard = threading.Lock()
 PACE_SECONDS_PER_USER = 5
 
 SYSTEM_PROMPT = (
-    "You are SSHETTY bot — brutally honest Solana memecoin assistant for Shashi.\n\n"
+    "You are SSHETTY bot — brutally honest Solana memecoin assistant.\n\n"
     "BOT MODULES (don't conflate):\n"
     " • watcher = narrative clusters → get_watcher_alerts\n"
     " • swfeed = 2+ smart wallets in same CA → get_smart_wallet_signals\n"
@@ -152,7 +152,7 @@ def memories_as_context() -> str:
     if not memories:
         return ""
     lines = "\n".join(f"- {m}" for m in memories)
-    return f"\n\nShashi's permanent rules & facts (always apply these):\n{lines}"
+    return f"\n\nUser's permanent rules & facts (always apply these):\n{lines}"
 
 def _get_user_lock(user_id):
     with _user_locks_guard:
@@ -500,7 +500,7 @@ def _send_daily_summary():
         pnl_emoji = "📈" if total_pnl >= 0 else "📉"
 
         lines = [
-            "☀️ *Good morning, Shashi — daily summary*\n",
+            "☀️ *Good morning — daily summary*\n",
             f"💰 Capital: *${capital:,.2f}*",
             f"📂 Open positions: *{len(open_pos)}*",
             "",
@@ -699,6 +699,129 @@ def handle_capital(message):
         bot.reply_to(message, "❌ Invalid amount. Example: `/capital 50`", parse_mode="Markdown")
 
 
+@bot.message_handler(commands=['reconcile_capital'])
+def handle_reconcile_capital(message):
+    """One-shot: subtract historical realized losses that pre-date the auto-debit
+    feature (commit afc3d4a) from state:capital_usd.
+
+    A closed position is considered "already accounted for" if its dict has the
+    `capital_after` field — that field is only written by the auto-debit code
+    path that landed in afc3d4a. Anything older gets summed and applied here,
+    once, with a tag recorded in Redis so this can't be run twice.
+
+    Usage: `/reconcile_capital`           — dry-run, shows what would change
+           `/reconcile_capital apply`     — actually apply"""
+    if not owner_only(message):
+        return
+    parts = (message.text or "").split()
+    apply_it = len(parts) > 1 and parts[1].lower() == "apply"
+
+    try:
+        raw = _redis.get("positions:closed")
+        closed = json.loads(raw) if raw else []
+    except Exception as e:
+        bot.reply_to(message, f"❌ Failed to read closed positions: {e}")
+        return
+
+    unaccounted = [p for p in (closed or [])
+                   if isinstance(p, dict)
+                   and p.get("pnl_usd") is not None
+                   and p.get("capital_after") is None]
+    total_pnl = sum(float(p.get("pnl_usd") or 0) for p in unaccounted)
+
+    already_applied = _redis.get("reconcile_capital:applied")
+
+    lines = ["*🧮 Capital reconciliation*", ""]
+    lines.append(f"Closed positions in history: {len(closed or [])}")
+    lines.append(f"Already auto-debited (have `capital_after` field): {len(closed or []) - len(unaccounted)}")
+    lines.append(f"Pre-auto-debit (would adjust): {len(unaccounted)}")
+    lines.append(f"Net adjustment: *${total_pnl:+.2f}*")
+    if already_applied:
+        lines.append("")
+        lines.append(f"⚠ Reconciliation was already applied at: {already_applied}")
+        lines.append("   Running again will double-count. Refusing.")
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+        return
+
+    cur_raw = _redis.get("state:capital_usd")
+    try:
+        cur = float(cur_raw) if cur_raw else 0.0
+    except (TypeError, ValueError):
+        cur = 0.0
+    new_cap = max(0.0, round(cur + total_pnl, 2))
+    lines.append("")
+    lines.append(f"Capital before: ${cur:.2f}")
+    lines.append(f"Capital after:  *${new_cap:.2f}*")
+
+    if not apply_it:
+        lines.append("")
+        lines.append("_Dry-run. Append `apply` to commit: `/reconcile_capital apply`_")
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+        return
+
+    # Apply
+    _redis.set("state:capital_usd", str(new_cap))
+    import time as _t
+    stamp = _t.strftime("%Y-%m-%d %H:%M:%S UTC", _t.gmtime())
+    _redis.set("reconcile_capital:applied", stamp)
+    _redis.set("reconcile_capital:adjustment", str(total_pnl))
+    lines.append("")
+    lines.append(f"✅ *Applied at {stamp}*. Locked — cannot run again.")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- CHAT-ACTION CONFIRMATION (pending action queue) ----------
+
+def _pending_action_get():
+    """Fetch the queued chat-action awaiting confirmation, or None if expired/empty."""
+    try:
+        raw = _redis.get("pending_action:current")
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+@bot.message_handler(commands=['confirm'])
+def handle_confirm(message):
+    """Confirm a pending chat-action (close_position, set_capital, etc.).
+    Action tools from chat now park here for 90s before executing — protects
+    against the LLM misreading 'close my position' when 2 are open."""
+    if not owner_only(message):
+        return
+    pending = _pending_action_get()
+    if not pending:
+        bot.reply_to(message, "❌ No pending action to confirm (or it expired — 90s TTL).")
+        return
+
+    name = pending.get("name")
+    args = pending.get("args") or {}
+    bot.reply_to(message, f"⚙ Executing confirmed `{name}`…", parse_mode="Markdown")
+
+    # Direct dispatch (skip the chat-action confirmation wrap, do the real action)
+    try:
+        import tools as _tools
+        result_str = _tools._execute_action_direct(name, args, caller_user_id=message.from_user.id)
+        bot.reply_to(message, f"✅ Result:\n```\n{result_str[:1500]}\n```", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Action failed: {e}")
+    finally:
+        _redis.delete("pending_action:current")
+
+
+@bot.message_handler(commands=['cancel'])
+def handle_cancel(message):
+    if not owner_only(message):
+        return
+    pending = _pending_action_get()
+    if not pending:
+        bot.reply_to(message, "Nothing pending.")
+        return
+    _redis.delete("pending_action:current")
+    bot.reply_to(message, f"❎ Cancelled pending `{pending.get('name')}`.", parse_mode="Markdown")
+
+
 # ---------- POSITION TRACKER COMMANDS ----------
 
 def _position_alert(text: str):
@@ -727,13 +850,23 @@ def handle_buy(message):
     parts = (message.text or "").split()
     if len(parts) < 2:
         bot.reply_to(message,
-            "Usage: `/buy <CA> [size_usd] [entry_price]`\n\n"
+            "Usage: `/buy <CA> [size_usd] [entry_price] [force]`\n\n"
             "Examples:\n"
             "  `/buy 7xKj...pump` — uses 15% of capital, live price\n"
             "  `/buy 7xKj...pump 5` — $5 size, live price\n"
-            "  `/buy 7xKj...pump 5 0.00012` — $5, manual entry price",
+            "  `/buy 7xKj...pump 5 0.00012` — $5, manual entry price\n"
+            "  `/buy 7xKj...pump 5 force` — override Capital Guard block\n\n"
+            "_Capital Guard runs first: blocks revenge trades, oversized bets, "
+            "graveyard liq, and SL-won't-fill scenarios._",
             parse_mode="Markdown")
         return
+
+    # Strip optional trailing `force` token
+    force = False
+    if parts[-1].lower() in ("force", "--force"):
+        force = True
+        parts = parts[:-1]
+
     mint = parts[1].strip()
     if not is_valid_solana_mint(mint):
         bot.reply_to(message, "❌ Not a valid Solana CA.")
@@ -749,17 +882,46 @@ def handle_buy(message):
         bot.reply_to(message, "❌ Size/entry must be numbers.")
         return
 
-    bot.reply_to(message, "📥 Opening position…")
+    # ---- CAPITAL GUARD ----
+    import capital_guard
+    import trade_card
+    # Fetch liq from DEXScreener pair (top pair by liq)
+    try:
+        import requests
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=8)
+        pairs = (r.json() or {}).get("pairs") or [] if r.status_code == 200 else []
+        pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+        liq_usd = (pairs[0].get("liquidity") or {}).get("usd") if pairs else None
+        if liq_usd is not None:
+            liq_usd = float(liq_usd)
+    except Exception:
+        liq_usd = None
+
+    capital_usd = trade_card.get_capital_usd()
+    live_price = entry or position_tracker.get_live_price(mint)
+    sl_price = (live_price * 0.70) if live_price else None
+    decision = capital_guard.run_guard(size, capital_usd, liq_usd, live_price, sl_price)
+    panel = capital_guard.format_panel(decision)
+
+    if decision["block"] and not force:
+        bot.reply_to(message,
+            panel + "\n\n🚫 *Buy refused.* Add `force` to override if you've read every block reason.",
+            parse_mode="Markdown")
+        return
+
+    bot.reply_to(message, panel, parse_mode="Markdown")
+    bot.send_message(message.chat.id, "📥 Opening position…")
     result = position_tracker.open_position(mint, size, entry)
     if not result.get("ok"):
         bot.reply_to(message, f"❌ {result.get('error', 'unknown error')}")
         return
     p = result["position"]
+    forced_tag = "  _(FORCED past guard)_" if (force and decision["block"]) else ""
     bot.send_message(
         message.chat.id,
-        f"✅ *Position opened — {p['symbol']}*\n\n"
+        f"✅ *Position opened — {p['symbol']}*{forced_tag}\n\n"
         + position_tracker.format_position(p, live_price=p["entry_price"])
-        + "\n\n_Tracker pinging you every 60s. TP1/TP2/SL fire automatically._",
+        + "\n\n_Tracker pinging TP1/TP2/SL. Polling adapts to liq depth._",
         parse_mode="Markdown", disable_web_page_preview=True,
     )
 
@@ -1115,7 +1277,7 @@ def handle_message(message):
         run_rug_check_and_remember(message, user_text)
         return
 
-    # Per-user lock + pacing — when Shashi batches messages, they serialize
+    # Per-user lock + pacing — when user batches messages, they serialize
     # through this lock and we sleep enough between each so they fit cleanly
     # inside the 12K TPM window. Different users don't block each other.
     lock = _get_user_lock(user_id)
