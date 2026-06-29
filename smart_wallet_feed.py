@@ -58,6 +58,8 @@ _alert_fn   = None  # set on start
 _last_cycle_alerts = 0
 _last_cycle_end_ts = None
 _cycles_completed  = 0
+_mem_alerted: set[str] = set()       # in-memory dedup backstop — survives Redis outages
+_mem_cursor: dict[str, str] = {}     # in-memory cursor fallback
 
 
 # ---------- RPC HELPERS ----------
@@ -127,13 +129,16 @@ def _extract_buys_for_wallet(parsed_txs: list, wallet: str) -> list:
 
 
 def _has_been_alerted(mint: str) -> bool:
+    if mint in _mem_alerted:
+        return True
     try:
         return _redis.get(f"sw_feed:alerted:{mint}") == "1"
     except Exception:
-        return False
+        return True  # fail-closed: if Redis is down, assume already alerted
 
 
 def _mark_alerted(mint: str):
+    _mem_alerted.add(mint)
     try:
         _redis.set(f"sw_feed:alerted:{mint}", "1", ex=ALERT_DEDUPE_TTL)
     except Exception:
@@ -198,12 +203,17 @@ def _record_accumulation(mint: str, wallet_addr: str, wallet_label: str, ts: int
     holders_key = f"sw_accum:holders:{mint}"
     dedup_key   = f"sw_accum:entry:{mint}:{wallet_addr}"
 
+    mem_dedup_key = f"{mint}:{wallet_addr}"
+    if mem_dedup_key in _mem_alerted:
+        return [], False
+
     # Already processed this wallet+token combo recently?
     try:
         if _redis.get(dedup_key):
+            _mem_alerted.add(mem_dedup_key)
             return [], False
     except Exception:
-        pass
+        return [], False  # fail-closed: can't verify dedup → skip
 
     # Load existing holders
     try:
@@ -223,6 +233,7 @@ def _record_accumulation(mint: str, wallet_addr: str, wallet_label: str, ts: int
             pass
 
     # Mark as processed — won't re-fire for this wallet+token for 7 days
+    _mem_alerted.add(mem_dedup_key)
     try:
         _redis.set(dedup_key, "1", ex=ACCUM_ENTRY_TTL)
     except Exception:
@@ -330,12 +341,17 @@ def _trigger_accumulation_alert(mint: str, prior_holders: list, new_buyer: dict)
 def _get_cursor(wallet: str) -> dict:
     try:
         raw = _redis.get(f"sw_feed:cursor:{wallet}")
-        return json.loads(raw) if raw else {}
+        if raw:
+            return json.loads(raw)
     except Exception:
-        return {}
+        pass
+    # Fall back to in-memory cursor
+    sig = _mem_cursor.get(wallet)
+    return {"last_sig": sig} if sig else {}
 
 
 def _save_cursor(wallet: str, last_sig: str):
+    _mem_cursor[wallet] = last_sig
     try:
         _redis.set(
             f"sw_feed:cursor:{wallet}",
